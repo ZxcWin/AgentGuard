@@ -22,9 +22,25 @@
 
 > **闭源版说明**：闭源商业版的产品边界与部署形态见 [`CLOSED_SOURCE.md`](CLOSED_SOURCE.md)。
 
+## 🐍 技术栈
+
+AgentGuard 开源版统一使用 **Python** 实现，不引入 TypeScript、Go 或其他语言作为运行时实现语言。
+
+- **实现语言**：Python；
+- **交付方式**：Python 包，通过 `pip` 安装和升级；
+- **核心形态**：Python SDK、Wrapper、装饰器、上下文管理器和插件接口；
+- **配置方式**：YAML 配置与 Python API 双重支持；
+- **可选后端**：内存、Redis、SQLite，以及 Chroma、Qdrant 等 Python 生态适配器；
+- **集成方式**：通过 Python 适配器接入 OpenAI、Anthropic、LangChain、LlamaIndex、FastAPI、Celery、MCP 等工具或框架。
+
+后续新增功能也应优先保持 Python 实现和 Python API 的一致性；闭源控制平面可以独立采用其他技术实现，但不属于本开源 SDK 的实现范围。
+
 ## 📖 目录
 
 - [为什么需要 AgentGuard](#-为什么需要-agentguard)
+- [技术栈](#-技术栈)
+- [实现计划](IMPLEMENTATION_PLAN.md)
+- [架构说明](ARCHITECTURE.md)
 - [快速接入](#-快速接入)
 - [核心功能](#-核心功能)
 - [Token 控制到底如何生效](#-token-控制到底如何生效)
@@ -176,6 +192,13 @@ token:
 
   # 超过预算时的行为：reject | downgrade | stop_stream
   on_exceeded: reject
+
+  # provider usage 缺失时的结算策略：estimate | unknown | reject
+  missing_usage: estimate
+  # provider usage 超过预估时：observe | reject
+  usage_mismatch: observe
+  # 未配置模型价格时：observe | reject
+  missing_price: observe
 ```
 
 ### 典型控制结果
@@ -398,6 +421,9 @@ rate_limit:
   rpm: 30 # 每分钟最多 30 个请求
   tpm: 100000 # 每分钟最多 100,000 Token
   max_concurrency: 10 # 最大并发 Run 数
+  max_tool_calls: null # 每个 scope key 的工具调用上限
+  max_scope_keys: 10000 # 本地 admission 保存的最大 scope key 数
+  wait_timeout_seconds: 0 # admission 最长等待时间；超时拒绝
 
 quality:
   min_similarity: 0.8 # 低于该阈值时触发重试
@@ -455,6 +481,13 @@ print(response.choices[0].message.content)
 | `rate_limit` | `rpm` | `int` | `None` | 每分钟最大请求数 |
 | `rate_limit` | `tpm` | `int` | `None` | 每分钟最大 Token 数 |
 | `rate_limit` | `max_concurrency` | `int` | `None` | 最大并发 Run 数 |
+| `rate_limit` | `max_tool_calls` | `int` | `None` | 每个 scope key 的工具调用上限 |
+| `rate_limit` | `max_scope_keys` | `int` | `10000` | 本地 admission 最大 scope key 数，空闲 key 可被清理 |
+| `rate_limit` | `wait_timeout_seconds` | `float` | `0` | admission 等待超时，超时后拒绝 |
+
+限流与熔断按配置的 scope key 隔离；本地 `AdmissionController` 同时管理 RPM、TPM 和并发
+reservation，`CircuitRegistry` 为每个 scope key 独立维护 closed/open/half-open 状态。
+上游异常会计入熔断，参数校验错误和预算/限流拒绝不会计入上游失败。
 | `rate_limit` | `cpd` | `float` | `None` | 每日最大成本（美元） |
 | `quality` | `min_similarity` | `float` | `0.7` | 语义相似度阈值 |
 | `quality` | `strict_json` | `bool` | `False` | 是否强制输出合法 JSON |
@@ -671,7 +704,7 @@ AgentGuard 不应只关注“模型调用花了多少钱”，还可以逐步覆
 - CLI 查看当前预算、策略和最近异常；
 - 本地策略模拟器：在不调用真实模型的情况下测试拦截结果；
 - 适配 FastAPI、Django、Celery、MCP 等常见运行环境；
-- 提供 TypeScript、Go 等语言的轻量客户端，连接统一控制平面。
+- 通过 Python 客户端连接统一控制平面，保持开源 SDK 的单语言实现。
 
 ### 商业化路径建议
 
