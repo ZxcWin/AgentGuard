@@ -1,1 +1,1 @@
-"""Dependency-inversion interfaces will be added in Phase 1."""
+"""依赖倒置接口将在后续阶段补充。"""

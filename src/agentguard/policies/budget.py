@@ -42,7 +42,7 @@ class BudgetManager:
     @staticmethod
     def _purpose(purpose: str) -> str:
         if purpose not in {"primary", "retry", "quality_retry", "fallback"}:
-            raise ValueError("purpose must be primary, retry, quality_retry, or fallback")
+            raise ValueError("purpose 必须是 primary、retry、quality_retry 或 fallback")
         return purpose
 
     def _retry_limit(self, value: int | Decimal | None) -> int | Decimal | None:
@@ -83,7 +83,7 @@ class BudgetManager:
         purpose = self._purpose(purpose)
         requested_cost = Decimal(str(cost_usd))
         if min(input_tokens, output_tokens) < 0 or requested_cost < 0 or not requested_cost.is_finite():
-            raise ValueError("budget values must be non-negative")
+            raise ValueError("预算值必须是非负数")
         requested_tokens = input_tokens + output_tokens
         buffered_tokens = int(requested_tokens * (1 + self.config.token.reservation_buffer) + 0.999999)
         buffered_cost = requested_cost * (Decimal(1) + Decimal(str(self.config.token.reservation_buffer)))
@@ -103,24 +103,24 @@ class BudgetManager:
                 Decimal(str(cost_limit)) if cost_limit is not None else None,
             )
             if self.config.token.max_input_tokens is not None and input_tokens > self.config.token.max_input_tokens:
-                raise BudgetExceeded("input token limit exceeded", reason_code="input_token_limit")
+                raise BudgetExceeded("输入 Token 超过限制", reason_code="input_token_limit")
             if self.config.token.max_output_tokens is not None and output_tokens > self.config.token.max_output_tokens:
-                raise BudgetExceeded("output token limit exceeded", reason_code="output_token_limit")
+                raise BudgetExceeded("输出 Token 超过限制", reason_code="output_token_limit")
             if token_limit is not None and current_tokens + self._reserved_tokens + buffered_tokens > token_limit:
-                raise BudgetExceeded("run token budget exceeded", reason_code="run_token_budget")
+                raise BudgetExceeded("Run Token 预算已超限", reason_code="run_token_budget")
             if cost_limit is not None and current_cost + self._reserved_cost_usd + buffered_cost > Decimal(str(cost_limit)):
-                raise BudgetExceeded("run cost budget exceeded", reason_code="run_cost_budget")
+                raise BudgetExceeded("Run 成本预算已超限", reason_code="run_cost_budget")
             if self.config.budget.max_cost_usd is not None and requested_cost > Decimal(str(self.config.budget.max_cost_usd)):
-                raise BudgetExceeded("request cost budget exceeded", reason_code="request_cost_budget")
+                raise BudgetExceeded("请求成本预算已超限", reason_code="request_cost_budget")
             if purpose != "primary":
                 retry_token_limit = self._retry_limit(token_limit)
                 retry_cost_limit = self._retry_limit(
                     Decimal(str(cost_limit)) if cost_limit is not None else None
                 )
                 if retry_token_limit is not None and self._spent_retry_tokens + self._reserved_retry_tokens + buffered_tokens > retry_token_limit:
-                    raise BudgetExceeded("retry budget exceeded", reason_code="retry_token_budget")
+                    raise BudgetExceeded("重试 Token 预算已超限", reason_code="retry_token_budget")
                 if retry_cost_limit is not None and self._spent_retry_cost_usd + self._reserved_retry_cost_usd + buffered_cost > retry_cost_limit:
-                    raise BudgetExceeded("retry cost budget exceeded", reason_code="retry_cost_budget")
+                    raise BudgetExceeded("重试成本预算已超限", reason_code="retry_cost_budget")
             self._reserved_tokens += buffered_tokens
             self._reserved_cost_usd += buffered_cost
             if purpose != "primary":
@@ -174,7 +174,7 @@ class BudgetManager:
 
 
 def estimate_tokens(value: object) -> int:
-    """Conservatively estimate tokens without requiring a provider tokenizer."""
+    """在不依赖供应商 tokenizer 的情况下保守估算 Token 数。"""
     if value is None:
         return 0
     if isinstance(value, str):

@@ -1,4 +1,4 @@
-"""Backward-compatible imports for public exceptions."""
+"""公共异常的向后兼容导入。"""
 
 from .domain.exceptions import (
     AgentGuardError,

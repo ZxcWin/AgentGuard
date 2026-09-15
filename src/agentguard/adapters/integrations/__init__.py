@@ -1,1 +1,1 @@
-"""Framework integrations are optional and thin."""
+"""框架集成均为可选依赖，并且只保留薄适配层。"""

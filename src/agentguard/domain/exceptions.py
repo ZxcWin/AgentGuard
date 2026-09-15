@@ -1,13 +1,13 @@
 class AgentGuardError(Exception):
-    """Base exception for AgentGuard errors."""
+    """AgentGuard 异常的基类。"""
 
 
 class ConfigurationError(AgentGuardError, ValueError):
-    """Raised when a configuration value is invalid."""
+    """配置值无效时抛出。"""
 
 
 class BudgetExceeded(AgentGuardError):
-    """Raised when a token or cost budget cannot cover a request."""
+    """Token 或成本预算无法覆盖请求时抛出。"""
 
     def __init__(self, message: str, *, reason_code: str = "budget_exceeded", retryable: bool = False) -> None:
         super().__init__(message)
@@ -16,11 +16,11 @@ class BudgetExceeded(AgentGuardError):
 
 
 class RateLimitExceeded(AgentGuardError):
-    """Raised when a request cannot enter the configured rate limit."""
+    """请求无法进入配置的限流窗口时抛出。"""
 
 
 class CircuitOpen(AgentGuardError):
-    """Raised when a circuit breaker is open."""
+    """熔断器处于打开状态时抛出。"""
 
 
 __all__ = [

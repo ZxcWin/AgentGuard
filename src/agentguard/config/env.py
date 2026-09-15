@@ -29,12 +29,12 @@ def environment_mapping(environ: Mapping[str, str] | None = None) -> dict[str, A
             continue
         path = key[len(PREFIX):].lower().split("__")
         if not path or any(not part for part in path):
-            raise ConfigurationError(f"invalid environment variable name: {key}")
+            raise ConfigurationError(f"环境变量名称无效：{key}")
         current = result
         for part in path[:-1]:
             existing = current.setdefault(part, {})
             if not isinstance(existing, dict):
-                raise ConfigurationError(f"conflicting environment variable path: {key}")
+                raise ConfigurationError(f"环境变量路径冲突：{key}")
             current = existing
         current[path[-1]] = _parse_value(value)
     return result

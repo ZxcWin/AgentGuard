@@ -5,7 +5,7 @@ from .exceptions import (
     ConfigurationError,
     RateLimitExceeded,
 )
-from .models import RunState, Usage, utc_now
+from .models import CallContext, RequestSnapshot, RunState, Usage, utc_now
 
 __all__ = [
     "AgentGuardError",
@@ -14,6 +14,8 @@ __all__ = [
     "ConfigurationError",
     "RateLimitExceeded",
     "RunState",
+    "CallContext",
+    "RequestSnapshot",
     "Usage",
     "utc_now",
 ]

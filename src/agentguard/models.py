@@ -1,4 +1,4 @@
-"""Backward-compatible imports for domain models."""
+"""领域模型的向后兼容导入。"""
 
 from .domain.models import RunState, Usage, utc_now
 

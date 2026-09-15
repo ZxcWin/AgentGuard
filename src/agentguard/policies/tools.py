@@ -7,7 +7,7 @@ from ..domain.exceptions import AgentGuardError
 
 
 class LoopDetected(AgentGuardError):
-    """Raised when an Agent repeats the same tool action too often."""
+    """Agent 重复执行同一工具动作过多次时抛出。"""
 
 
 @dataclass
@@ -20,11 +20,11 @@ class BehaviorFingerprint:
     def check(self, tool_name: str, arguments: Any = None) -> None:
         self.steps += 1
         if self.max_steps is not None and self.steps > self.max_steps:
-            raise LoopDetected("maximum Agent steps exceeded")
+            raise LoopDetected("Agent 步数已超过上限")
         key = f"{tool_name}:{repr(arguments)}"
         self._calls[key] = self._calls.get(key, 0) + 1
         if self._calls[key] > self.max_repeated_calls:
-            raise LoopDetected(f"repeated tool call detected: {tool_name}")
+            raise LoopDetected(f"检测到重复的工具调用：{tool_name}")
 
 
 class ToolGuard:
@@ -36,7 +36,7 @@ class ToolGuard:
     def wrap(self, tool_name: str, function: Callable[..., Any]) -> Callable[..., Any]:
         def guarded(*args: Any, **kwargs: Any) -> Any:
             if self.max_calls is not None and self.calls >= self.max_calls:
-                raise LoopDetected("maximum tool calls exceeded")
+                raise LoopDetected("工具调用次数已超过上限")
             self.fingerprint.check(tool_name, {"args": args, "kwargs": kwargs})
             self.calls += 1
             return function(*args, **kwargs)

@@ -28,7 +28,7 @@ class QualityResult:
 class QualityGuard:
     def __init__(self, min_similarity: float = 0.7, strict_json: bool = False) -> None:
         if not 0 <= min_similarity <= 1:
-            raise ValueError("min_similarity must be between 0 and 1")
+            raise ValueError("min_similarity 必须介于 0 和 1 之间")
         self.min_similarity = min_similarity
         self.strict_json = strict_json
         self._evaluators: list[Callable[[Any], QualityResult]] = []
@@ -42,7 +42,7 @@ class QualityGuard:
             try:
                 json.loads(content)
             except (TypeError, ValueError):
-                return QualityResult(False, reason="response is not valid JSON", action=QualityAction.RETRY)
+                return QualityResult(False, reason="响应不是有效的 JSON", action=QualityAction.RETRY)
         for evaluator in self._evaluators:
             result = evaluator(response)
             if not result.passed:

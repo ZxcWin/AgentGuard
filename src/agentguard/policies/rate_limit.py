@@ -26,7 +26,7 @@ class SlidingWindowLimiter:
         if self.limit is None:
             return True
         if amount < 0:
-            raise ValueError("amount must be non-negative")
+            raise ValueError("数量必须是非负数")
         now = monotonic()
         with self._lock:
             self._prune(now)
@@ -53,7 +53,7 @@ class ConcurrencyLimiter:
             while self._active >= self.limit:
                 remaining = None if deadline is None else deadline - monotonic()
                 if remaining is not None and remaining <= 0:
-                    raise RateLimitExceeded("concurrency limit exceeded")
+                    raise RateLimitExceeded("并发限制已超出")
                 self._condition.wait(remaining)
             self._active += 1
         try:
@@ -94,7 +94,7 @@ class RateLimiter:
             if self.try_acquire(tokens):
                 return
             if monotonic() >= deadline:
-                raise RateLimitExceeded("request or token rate limit exceeded")
+                raise RateLimitExceeded("请求速率或 Token 速率限制已超出")
             sleep(min(0.05, max(0.0, deadline - monotonic())))
 
     def release(self, tokens: int = 1) -> None:
@@ -119,9 +119,9 @@ class CircuitBreaker:
             if self.opened_at is None:
                 return
             if monotonic() - self.opened_at < self.recovery_seconds:
-                raise CircuitOpen("circuit breaker is open")
+                raise CircuitOpen("熔断器已打开")
             if self.probe_in_flight:
-                raise CircuitOpen("circuit breaker recovery probe is busy")
+                raise CircuitOpen("熔断器恢复探测正在执行")
             self.probe_in_flight = True
 
     def record_success(self) -> None:
@@ -139,7 +139,7 @@ class CircuitBreaker:
 
 
 class CircuitRegistry:
-    """Keeps independent circuit breakers for bounded scope keys."""
+    """为受限数量的 scope key 保存相互独立的熔断器。"""
 
     def __init__(
         self,
@@ -149,7 +149,7 @@ class CircuitRegistry:
         max_keys: int = 10_000,
     ) -> None:
         if failure_threshold <= 0 or recovery_seconds < 0 or max_keys <= 0:
-            raise ValueError("circuit settings must be positive")
+            raise ValueError("熔断配置必须是正数")
         self.failure_threshold = failure_threshold
         self.recovery_seconds = recovery_seconds
         self.max_keys = max_keys
@@ -162,7 +162,7 @@ class CircuitRegistry:
             if breaker is not None:
                 return breaker
             if len(self._breakers) >= self.max_keys:
-                raise CircuitOpen("circuit key cardinality limit exceeded")
+                raise CircuitOpen("熔断 scope key 数量已超限")
             breaker = CircuitBreaker(self.failure_threshold, self.recovery_seconds)
             self._breakers[key] = breaker
             return breaker
@@ -200,7 +200,7 @@ class AdmissionLease:
 
 
 class AdmissionController:
-    """Atomically admits request rate, token rate, and concurrency by key."""
+    """按 key 以原子方式管理请求速率、Token 速率和并发准入。"""
 
     def __init__(self, config: RateLimitConfig) -> None:
         self.config = config
@@ -227,7 +227,7 @@ class AdmissionController:
                     self._states.pop(expired_key, None)
                     self._last_used.pop(expired_key, None)
                 else:
-                    raise RateLimitExceeded("admission scope key cardinality limit exceeded")
+                    raise RateLimitExceeded("准入 scope key 数量已超限")
             state = (RateLimiter(self.config), ConcurrencyLimiter(self.config.max_concurrency))
             self._states[key] = state
             self._last_used[key] = current_time
@@ -263,14 +263,14 @@ class AdmissionController:
         tool: bool = False,
     ) -> AdmissionLease:
         if tokens < 0:
-            raise ValueError("tokens must be non-negative")
+            raise ValueError("Token 数必须是非负数")
         deadline = None if wait is None else monotonic() + wait
         while True:
             lease = self.try_acquire(tokens, key=key, tool=tool)
             if lease is not None:
                 return lease
             if deadline is not None and monotonic() >= deadline:
-                raise RateLimitExceeded("admission limit exceeded")
+                raise RateLimitExceeded("准入限制已超出")
             sleep(0.01 if deadline is None else min(0.05, max(0.0, deadline - monotonic())))
 
     def _release(self, key: str) -> None:

@@ -1,1 +1,1 @@
-"""Telemetry adapters are optional and must not affect policy decisions."""
+"""遥测适配器均为可选依赖，且不得影响策略决策。"""

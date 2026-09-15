@@ -1,1 +1,1 @@
-"""Optional integrations and infrastructure adapters."""
+"""可选集成和基础设施适配器。"""

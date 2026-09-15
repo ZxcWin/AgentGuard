@@ -1,1 +1,1 @@
-"""Command-line entry points will be added in a later phase."""
+"""命令行入口将在后续阶段补充。"""

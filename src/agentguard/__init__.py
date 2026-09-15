@@ -13,7 +13,7 @@ from .config import (
     environment_mapping,
     load_config,
 )
-from .domain import RunState, Usage
+from .domain import CallContext, RequestSnapshot, RunState, Usage
 from .domain.exceptions import (
     AgentGuardError,
     BudgetExceeded,
@@ -21,7 +21,7 @@ from .domain.exceptions import (
     ConfigurationError,
     RateLimitExceeded,
 )
-from .adapters.storage import MemoryCache, make_cache_key
+from .adapters.storage import MemoryCache, RedisAdmissionBackend, RedisAdmissionController, RedisAdmissionLease, RedisControllerLease, make_cache_key
 from .policies import (
     AdmissionController,
     AdmissionLease,
@@ -60,6 +60,10 @@ __all__ = [
     "InterceptorChain",
     "LoopDetected",
     "MemoryCache",
+    "RedisAdmissionBackend",
+    "RedisAdmissionController",
+    "RedisAdmissionLease",
+    "RedisControllerLease",
     "QualityAction",
     "QualityGuard",
     "QualityResult",
@@ -67,6 +71,8 @@ __all__ = [
     "RateLimitExceeded",
     "RateLimiter",
     "RunState",
+    "CallContext",
+    "RequestSnapshot",
     "RunContext",
     "TokenConfig",
     "ToolGuard",

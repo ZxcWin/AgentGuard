@@ -1,4 +1,4 @@
-"""Backward-compatible imports for tool policies."""
+"""工具策略的向后兼容导入。"""
 
 from .policies.tools import BehaviorFingerprint, LoopDetected, ToolGuard
 

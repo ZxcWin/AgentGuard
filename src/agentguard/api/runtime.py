@@ -1,7 +1,6 @@
-"""Stable public runtime API.
+"""稳定的公共运行时 API。
 
-The implementation lives in :mod:`agentguard.application.runtime`; this
-module intentionally contains no orchestration logic.
+实现位于 :mod:`agentguard.application.runtime`；本模块有意不包含编排逻辑。
 """
 
 from ..application.runtime import AgentGuard, GuardedProxy, RunContext, current_run, guard

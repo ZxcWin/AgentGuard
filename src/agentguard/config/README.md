@@ -38,6 +38,10 @@ token:
 重试类 reservation 必须通过 `BudgetManager.reserve(..., purpose="retry")`（或
 `quality_retry`、`fallback`）申请；它们同时受父 Run 硬预算和独立重试预算约束。
 
+限流后端默认是 `memory`。配置 `backend: redis` 时必须提供 `redis_url`；Redis 连接或
+脚本失败默认按 `redis_failure_policy: reject` 拒绝请求，也可显式设为 `memory` 回退到
+本地 admission。回退会保留本地并发限制，但不再声称具备跨进程 RPM/TPM 一致性。
+
 预算动作设为 `downgrade` 时，需配置 `degradation.fallback_model`。只有因父 Run、单次
 请求 token/cost 硬预算拒绝时才会切换，并记录原模型、备用模型和拒绝原因；备用模型再次
 无法预留预算时仍抛出原始 `BudgetExceeded`。流式请求会把请求前预估限制在剩余预算内，

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-__all__ = ["RunState", "Usage", "utc_now"]
+__all__ = ["CallContext", "RequestSnapshot", "RunState", "Usage", "utc_now"]
 from uuid import uuid4
 
 
@@ -23,13 +23,39 @@ class Usage:
     def __post_init__(self) -> None:
         values = (self.input_tokens, self.output_tokens, self.cached_tokens, self.reasoning_tokens)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
-            raise ValueError("usage token values must be non-negative integers")
+            raise ValueError("usage 的 Token 数必须是非负整数")
         if self.source not in {"provider", "tokenizer", "estimate", "unknown"}:
-            raise ValueError("usage source must be provider, tokenizer, estimate, or unknown")
+            raise ValueError("usage 来源必须是 provider、tokenizer、estimate 或 unknown")
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """一次模型或工具调用的稳定关联信息。"""
+
+    call_type: str = "llm"
+    request_id: str = field(default_factory=lambda: f"req_{uuid4().hex}")
+    trace_id: str = field(default_factory=lambda: f"trace_{uuid4().hex}")
+    run_id: str = ""
+    parent_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    attempt: int = 1
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class RequestSnapshot:
+    """不持有供应商对象的标准化请求快照。"""
+
+    model: str | None = None
+    messages: Any = None
+    parameters: dict[str, Any] = field(default_factory=dict)
+    stream: bool = False
+    data_classification: str | None = None
 
 
 @dataclass
@@ -41,6 +67,7 @@ class RunState:
     environment: str | None = None
     agent_id: str | None = None
     run_id: str = field(default_factory=lambda: f"run_{uuid4().hex}")
+    trace_id: str = field(default_factory=lambda: f"trace_{uuid4().hex}")
     started_at: datetime = field(default_factory=utc_now)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -74,6 +101,7 @@ class RunState:
     def summary(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "trace_id": self.trace_id,
             "agent_name": self.name,
             "user_id": self.user_id,
             "tenant_id": self.tenant_id,

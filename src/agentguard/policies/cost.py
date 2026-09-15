@@ -15,9 +15,9 @@ def _decimal(value: object, name: str) -> Decimal:
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as error:
-        raise ConfigurationError(f"{name} must be a valid decimal") from error
+        raise ConfigurationError(f"{name} 必须是有效的十进制数") from error
     if not result.is_finite() or result < 0:
-        raise ConfigurationError(f"{name} must be a finite non-negative decimal")
+        raise ConfigurationError(f"{name} 必须是有限的非负十进制数")
     return result
 
 

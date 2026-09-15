@@ -1,4 +1,4 @@
-"""Backward-compatible imports for quality policies."""
+"""质量策略的向后兼容导入。"""
 
 from .policies.quality import QualityAction, QualityGuard, QualityResult
 

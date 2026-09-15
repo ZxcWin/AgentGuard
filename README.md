@@ -418,6 +418,11 @@ budget:
   run_cost_usd: 0.50 # 一次 Agent Run 的累计成本上限
 
 rate_limit:
+  backend: memory # memory | redis
+  redis_url: null # backend=redis 时必填
+  redis_failure_policy: reject # reject | memory
+  redis_prefix: agentguard
+  redis_window_seconds: 60
   rpm: 30 # 每分钟最多 30 个请求
   tpm: 100000 # 每分钟最多 100,000 Token
   max_concurrency: 10 # 最大并发 Run 数
@@ -484,10 +489,19 @@ print(response.choices[0].message.content)
 | `rate_limit` | `max_tool_calls` | `int` | `None` | 每个 scope key 的工具调用上限 |
 | `rate_limit` | `max_scope_keys` | `int` | `10000` | 本地 admission 最大 scope key 数，空闲 key 可被清理 |
 | `rate_limit` | `wait_timeout_seconds` | `float` | `0` | admission 等待超时，超时后拒绝 |
+| `rate_limit` | `backend` | `str` | `memory` | admission 后端：`memory` 或 `redis` |
+| `rate_limit` | `redis_url` | `str` | `None` | Redis 后端连接地址 |
+| `rate_limit` | `redis_failure_policy` | `str` | `reject` | Redis 不可用时拒绝或回退本地 admission |
+| `rate_limit` | `redis_prefix` | `str` | `agentguard` | Redis key 前缀 |
+| `rate_limit` | `redis_window_seconds` | `int` | `60` | Redis 滑动窗口时长 |
 
 限流与熔断按配置的 scope key 隔离；本地 `AdmissionController` 同时管理 RPM、TPM 和并发
 reservation，`CircuitRegistry` 为每个 scope key 独立维护 closed/open/half-open 状态。
 上游异常会计入熔断，参数校验错误和预算/限流拒绝不会计入上游失败。
+
+需要跨进程限流时，可选使用 `RedisAdmissionBackend`。它通过 Lua 原子脚本和 Redis 服务端
+时钟完成 RPM/TPM reservation，并返回必须在调用结束时释放的 lease；核心安装不强制依赖
+Redis 客户端，需由应用自行注入兼容 client。
 | `rate_limit` | `cpd` | `float` | `None` | 每日最大成本（美元） |
 | `quality` | `min_similarity` | `float` | `0.7` | 语义相似度阈值 |
 | `quality` | `strict_json` | `bool` | `False` | 是否强制输出合法 JSON |
@@ -641,7 +655,7 @@ AgentGuard 不应只关注“模型调用花了多少钱”，还可以逐步覆
 
 路线图按“先保证运行时控制，再建设治理平台”的顺序推进。复选框表示当前 README 规划状态，实际完成情况应以代码、测试和发布说明为准。
 
-### Runtime Guard（开源优先）
+### 运行时守卫（开源优先）
 
 - [ ] Token 预估、预留、精确结算和 Run 级硬预算
 - [ ] 单次请求 `max_output_tokens` 注入与流式停止

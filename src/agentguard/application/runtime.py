@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-"""Runtime call pipeline and lifecycle orchestration.
+"""运行时调用管线和生命周期编排。
 
-This module owns execution sequencing. Public callers should import the
-stable facade from ``agentguard.api`` instead.
+本模块负责执行顺序。公共调用方应从 ``agentguard.api`` 导入稳定 facade。
 """
 
 from contextlib import AbstractContextManager
@@ -18,8 +17,10 @@ from ..policies.cost import PricingTable
 from ..config.loader import AgentGuardConfig
 from ..config.manager import ConfigManager
 from ..policies.rate_limit import AdmissionController, CircuitRegistry
+from ..adapters.storage.redis import RedisAdmissionController
+from .interceptors import BaseInterceptor, InterceptorChain
 from ..domain.exceptions import BudgetExceeded, RateLimitExceeded
-from ..domain.models import RunState, Usage
+from ..domain.models import CallContext, RequestSnapshot, RunState, Usage
 
 
 _current_run: ContextVar["RunContext | None"] = ContextVar("agentguard_run", default=None)
@@ -40,7 +41,17 @@ class RunContext(AbstractContextManager["RunContext"]):
         self.pricing = PricingTable.from_config(self.config.pricing)
         self.budget = BudgetManager(self.config, self.state, self.pricing)
         self.admission = AdmissionController(self.config.rate_limit)
+        if self.config.rate_limit.backend == "redis":
+            try:
+                import importlib
+
+                redis_module = importlib.import_module("redis")
+            except ImportError as error:
+                raise RuntimeError("Redis 后端需要安装 Redis 客户端") from error
+            client = redis_module.Redis.from_url(self.config.rate_limit.redis_url)
+            self.admission = RedisAdmissionController(client, self.config.rate_limit)
         self.circuits = CircuitRegistry()
+        self.interceptors = InterceptorChain()
         self._token = None
 
     def __enter__(self) -> "RunContext":
@@ -63,9 +74,13 @@ class RunContext(AbstractContextManager["RunContext"]):
     ) -> T:
         return _invoke_guarded(self, function, *args, budget_purpose=budget_purpose, **kwargs)
 
+    def add_interceptor(self, interceptor: BaseInterceptor) -> None:
+        """向当前 Run 添加一个拦截器。"""
+        self.interceptors.add(interceptor)
+
     def invoke_tool(self, tool_name: str, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         if not tool_name or not isinstance(tool_name, str):
-            raise ValueError("tool_name must be a non-empty string")
+            raise ValueError("tool_name 必须是非空字符串")
         key = "|".join(self.scope_key(tool=tool_name))
         try:
             admission = self.admission.acquire(
@@ -153,12 +168,12 @@ def _resolve_usage(context: RunContext, estimated: Usage, actual: Usage, model: 
         policy = context.config.token.missing_price
         context.state.record("budget.price_missing", model=model, action=policy)
         if policy == "reject":
-            raise BudgetExceeded("no price is configured for the model", reason_code="price_missing")
+            raise BudgetExceeded("未配置该模型的价格", reason_code="price_missing")
     if actual.source == "unknown":
         policy = context.config.token.missing_usage
         context.state.record("budget.usage_missing", action=policy)
         if policy == "reject":
-            raise BudgetExceeded("provider usage is missing or invalid", reason_code="usage_missing")
+            raise BudgetExceeded("供应商 usage 缺失或无效", reason_code="usage_missing")
         if policy == "estimate":
             return estimated
         return actual
@@ -170,7 +185,7 @@ def _resolve_usage(context: RunContext, estimated: Usage, actual: Usage, model: 
             action=context.config.token.usage_mismatch,
         )
         if context.config.token.usage_mismatch == "reject":
-            raise BudgetExceeded("provider usage exceeds the reservation estimate", reason_code="usage_mismatch")
+            raise BudgetExceeded("供应商 usage 超过预留估算值", reason_code="usage_mismatch")
     return actual
 
 
@@ -218,6 +233,228 @@ def _stream_token_count(chunk: Any) -> int:
     return estimate_tokens(chunk)
 
 
+def _call_metadata(context: RunContext, model: str | None, call_type: str = "llm") -> CallContext:
+    return CallContext(
+        call_type=call_type,
+        run_id=context.state.run_id,
+        trace_id=context.state.trace_id,
+        model=model,
+    )
+
+
+@dataclass
+class _PreparedCall:
+    """请求准备阶段的标准化结果。"""
+
+    function: Callable[..., Any]
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    call_context: CallContext
+    model: str | None
+    original_model: str | None
+    estimated_usage: Usage
+    estimated_cost: float
+
+
+@dataclass
+class _AdmittedCall:
+    """准入和预算预留阶段的结果。"""
+
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    model: str | None
+    estimated_usage: Usage
+    estimated_cost: float
+    admission: Any
+    reservation: Any
+    circuit_key: str
+
+
+def _apply_interceptors(
+    context: RunContext,
+    call_context: CallContext,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    request = {
+        "call": call_context,
+        "args": args,
+        "kwargs": dict(kwargs),
+        "snapshot": RequestSnapshot(
+            model=kwargs.get("model"),
+            messages=kwargs.get("messages", args[0] if args else None),
+            parameters={key: value for key, value in kwargs.items() if key not in {"messages", "model"}},
+            stream=kwargs.get("stream") is True,
+        ),
+    }
+    updated = context.interceptors.before_request(request)
+    if updated is None:
+        raise BudgetExceeded("请求被拦截器阻止", reason_code="interceptor_blocked")
+    updated_args = updated.get("args", args)
+    updated_kwargs = updated.get("kwargs", kwargs)
+    if not isinstance(updated_args, tuple) or not isinstance(updated_kwargs, dict):
+        raise TypeError("拦截器必须返回 tuple 类型的 args 和 dict 类型的 kwargs")
+    return updated_args, updated_kwargs
+
+
+def _prepare_call(
+    context: RunContext,
+    function: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> _PreparedCall:
+    """完成请求标准化、拦截器处理和预算预估。"""
+    prepared_kwargs = _prepare_request(context, function, kwargs)
+    call_context = _call_metadata(context, prepared_kwargs.get("model"))
+    prepared_args, prepared_kwargs = _apply_interceptors(
+        context, call_context, args, prepared_kwargs
+    )
+    input_tokens, output_tokens = _request_estimates(context, prepared_args, prepared_kwargs)
+    model = prepared_kwargs.get("model")
+    estimated_usage = Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        source="estimate",
+    )
+    estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
+    if prepared_kwargs.get("stream") is True and context.config.token.run_token_budget is not None:
+        remaining_budget = (
+            context.config.token.run_token_budget
+            - context.state.total_tokens
+            - context.budget._reserved_tokens
+        )
+        max_reserved_request = int(remaining_budget / (1 + context.config.token.reservation_buffer))
+        remaining_output = max(0, max_reserved_request - input_tokens)
+        if output_tokens > remaining_output:
+            output_tokens = remaining_output
+            estimated_usage = Usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                source="estimate",
+            )
+            for parameter in ("max_output_tokens", "max_tokens"):
+                if parameter in prepared_kwargs:
+                    prepared_kwargs = dict(prepared_kwargs)
+                    prepared_kwargs[parameter] = output_tokens
+                    break
+            context.state.record(
+                "budget.stream_reservation_capped",
+                estimated_output_tokens=output_tokens,
+                limit=context.config.token.run_token_budget,
+            )
+            estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
+    return _PreparedCall(
+        function=function,
+        args=prepared_args,
+        kwargs=prepared_kwargs,
+        call_context=call_context,
+        model=model,
+        original_model=model,
+        estimated_usage=estimated_usage,
+        estimated_cost=estimated_cost,
+    )
+
+
+def _admit_call(
+    context: RunContext,
+    prepared: _PreparedCall,
+    *,
+    budget_purpose: str,
+) -> _AdmittedCall:
+    """执行 admission、熔断检查和预算预留。"""
+    args = prepared.args
+    kwargs = prepared.kwargs
+    model = prepared.model
+    estimated_usage = prepared.estimated_usage
+    estimated_cost = prepared.estimated_cost
+    key = "|".join(context.scope_key(model=model))
+    try:
+        admission = context.admission.acquire(
+            estimated_usage.total_tokens,
+            key=key,
+            wait=context.config.rate_limit.wait_timeout_seconds,
+        )
+    except RateLimitExceeded:
+        context.state.record(
+            "rate_limit.rejected",
+            reason_code="admission_timeout",
+            waited_seconds=context.config.rate_limit.wait_timeout_seconds,
+        )
+        raise
+    circuit_key = key
+    try:
+        context.circuits.before_call(circuit_key)
+    except BaseException:
+        context.state.record("circuit.rejected", reason_code="circuit_open")
+        admission.release()
+        raise
+    try:
+        reservation = context.budget.reserve(
+            estimated_usage.input_tokens,
+            estimated_usage.output_tokens,
+            estimated_cost,
+            purpose=budget_purpose,
+        )
+    except BudgetExceeded as error:
+        admission.release()
+        fallback_model = context.config.degradation.fallback_model
+        can_downgrade = (
+            context.config.token.on_exceeded == "downgrade"
+            and fallback_model
+            and model != fallback_model
+            and error.reason_code in {"run_token_budget", "run_cost_budget", "request_cost_budget"}
+        )
+        if not can_downgrade:
+            context.state.record(
+                "budget.rejected",
+                reason_code=error.reason_code,
+                action=context.config.token.on_exceeded,
+                retryable=error.retryable,
+            )
+            raise
+        kwargs = dict(kwargs)
+        kwargs["model"] = fallback_model
+        model = fallback_model
+        input_tokens, output_tokens = _request_estimates(context, args, kwargs)
+        estimated_usage = Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            source="estimate",
+        )
+        estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
+        try:
+            reservation = context.budget.reserve(
+                input_tokens,
+                output_tokens,
+                estimated_cost,
+                purpose="fallback",
+            )
+        except BudgetExceeded:
+            context.state.record(
+                "budget.rejected",
+                reason_code=error.reason_code,
+                action="downgrade",
+                retryable=error.retryable,
+            )
+            raise error
+        context.state.record(
+            "budget.downgraded",
+            from_model=prepared.model,
+            to_model=fallback_model,
+            reason_code=error.reason_code,
+        )
+    return _AdmittedCall(
+        args=args,
+        kwargs=kwargs,
+        model=model,
+        estimated_usage=estimated_usage,
+        estimated_cost=estimated_cost,
+        admission=admission,
+        reservation=reservation,
+        circuit_key=circuit_key,
+    )
+
+
 def _finish_sync_stream(
     context: RunContext,
     result: Any,
@@ -227,11 +464,13 @@ def _finish_sync_stream(
     admission: Any,
     circuits: CircuitRegistry,
     circuit_key: str,
+    call_context: CallContext,
 ) -> Any:
     output_tokens = 0
     provider_usage: Usage | None = None
     try:
         for chunk in result:
+            chunk = context.interceptors.on_chunk(chunk, call_context)
             chunk_usage = _extract_usage(chunk)
             if chunk_usage.source != "unknown":
                 provider_usage = chunk_usage
@@ -244,10 +483,11 @@ def _finish_sync_stream(
                     actual_tokens=context.state.total_tokens + estimated_usage.input_tokens + output_tokens,
                     limit=token_limit,
                 )
-                raise BudgetExceeded("stream token budget exceeded", reason_code="stream_token_budget")
+                raise BudgetExceeded("流式 Token 预算已超限", reason_code="stream_token_budget")
             yield chunk
     except BaseException as error:
         circuits.record_failure(circuit_key, error)
+        context.interceptors.on_error(error)
         raise
     finally:
         usage = provider_usage or Usage(
@@ -262,7 +502,9 @@ def _finish_sync_stream(
             circuits.record_success(circuit_key)
             admission.release()
             context.state.record("llm.completed", total_tokens=usage.total_tokens)
+            context.interceptors.on_finish(call_context)
         except BaseException:
+            context.interceptors.on_finish(call_context)
             admission.release()
             reservation.release()
             context.state.record("llm.failed")
@@ -278,11 +520,13 @@ async def _finish_async_stream(
     admission: Any,
     circuits: CircuitRegistry,
     circuit_key: str,
+    call_context: CallContext,
 ) -> Any:
     output_tokens = 0
     provider_usage: Usage | None = None
     try:
         async for chunk in result:
+            chunk = context.interceptors.on_chunk(chunk, call_context)
             chunk_usage = _extract_usage(chunk)
             if chunk_usage.source != "unknown":
                 provider_usage = chunk_usage
@@ -295,10 +539,11 @@ async def _finish_async_stream(
                     actual_tokens=context.state.total_tokens + estimated_usage.input_tokens + output_tokens,
                     limit=token_limit,
                 )
-                raise BudgetExceeded("stream token budget exceeded", reason_code="stream_token_budget")
+                raise BudgetExceeded("流式 Token 预算已超限", reason_code="stream_token_budget")
             yield chunk
     except BaseException as error:
         circuits.record_failure(circuit_key, error)
+        context.interceptors.on_error(error)
         raise
     finally:
         usage = provider_usage or Usage(
@@ -313,11 +558,178 @@ async def _finish_async_stream(
             circuits.record_success(circuit_key)
             admission.release()
             context.state.record("llm.completed", total_tokens=usage.total_tokens)
+            context.interceptors.on_finish(call_context)
         except BaseException:
+            context.interceptors.on_finish(call_context)
             admission.release()
             reservation.release()
             context.state.record("llm.failed")
             raise
+
+
+def _fail_call(
+    context: RunContext,
+    error: BaseException,
+    reservation: Any,
+    admission: Any,
+    circuits: CircuitRegistry,
+    circuit_key: str,
+    call_context: CallContext,
+) -> None:
+    """统一执行调用失败时的熔断、拦截器和资源清理。"""
+    try:
+        circuits.record_failure(circuit_key, error)
+        context.interceptors.on_error(error)
+    finally:
+        try:
+            context.interceptors.on_finish(call_context)
+        finally:
+            admission.release()
+            reservation.release()
+            context.state.record("llm.failed")
+
+
+def _settle_response(
+    context: RunContext,
+    response: Any,
+    reservation: Any,
+    estimated_usage: Usage,
+    estimated_cost: float,
+    model: str | None,
+    admission: Any,
+    circuits: CircuitRegistry,
+    circuit_key: str,
+    call_context: CallContext,
+) -> Any:
+    """统一处理非流式响应、实际 usage、结算和成功事件。"""
+    response = context.interceptors.after_response(response)
+    usage = _resolve_usage(context, estimated_usage, _extract_usage(response), model)
+    actual_cost = context.pricing.estimate(model, usage) or estimated_cost
+    reservation.settle(usage, actual_cost)
+    circuits.record_success(circuit_key)
+    admission.release()
+    context.state.record("llm.completed", total_tokens=usage.total_tokens)
+    context.interceptors.on_finish(call_context)
+    return response
+
+
+def _start_call(
+    context: RunContext,
+    function: Callable[..., Any],
+    admitted: _AdmittedCall,
+    call_context: CallContext,
+) -> Any:
+    """启动一次供应商调用，并记录调用开始阶段事件。"""
+    context.interceptors.on_start(call_context)
+    context.state.llm_calls += 1
+    context.state.record(
+        "llm.requested",
+        estimated_tokens=admitted.estimated_usage.total_tokens,
+        request_id=call_context.request_id,
+        trace_id=call_context.trace_id,
+        run_id=call_context.run_id,
+        parent_id=call_context.parent_id,
+        attempt=call_context.attempt,
+    )
+    try:
+        return function(*admitted.args, **admitted.kwargs)
+    except BaseException as error:
+        _fail_call(
+            context,
+            error,
+            admitted.reservation,
+            admitted.admission,
+            context.circuits,
+            admitted.circuit_key,
+            call_context,
+        )
+        raise
+
+
+def _dispatch_response(
+    context: RunContext,
+    result: Any,
+    admitted: _AdmittedCall,
+    call_context: CallContext,
+) -> Any:
+    """按返回对象类型分派到同步、异步或流式消费阶段。"""
+    if admitted.kwargs.get("stream") is True and hasattr(result, "__aiter__"):
+        return _finish_async_stream(
+            context,
+            result,
+            admitted.reservation,
+            admitted.estimated_usage,
+            admitted.model,
+            admitted.admission,
+            context.circuits,
+            admitted.circuit_key,
+            call_context,
+        )
+    if admitted.kwargs.get("stream") is True and hasattr(result, "__iter__"):
+        return _finish_sync_stream(
+            context,
+            result,
+            admitted.reservation,
+            admitted.estimated_usage,
+            admitted.model,
+            admitted.admission,
+            context.circuits,
+            admitted.circuit_key,
+            call_context,
+        )
+    if isawaitable(result):
+        async def finish() -> Any:
+            try:
+                response = await result
+                return _settle_response(
+                    context,
+                    response,
+                    admitted.reservation,
+                    admitted.estimated_usage,
+                    admitted.estimated_cost,
+                    admitted.model,
+                    admitted.admission,
+                    context.circuits,
+                    admitted.circuit_key,
+                    call_context,
+                )
+            except BaseException as error:
+                _fail_call(
+                    context,
+                    error,
+                    admitted.reservation,
+                    admitted.admission,
+                    context.circuits,
+                    admitted.circuit_key,
+                    call_context,
+                )
+                raise
+
+        return finish()
+    try:
+        return _settle_response(
+            context,
+            result,
+            admitted.reservation,
+            admitted.estimated_usage,
+            admitted.estimated_cost,
+            admitted.model,
+            admitted.admission,
+            context.circuits,
+            admitted.circuit_key,
+            call_context,
+        )
+    except BaseException as error:
+        _fail_call(
+            context,
+            error,
+            admitted.reservation,
+            admitted.admission,
+            context.circuits,
+            admitted.circuit_key,
+            call_context,
+        )
+        raise
 
 
 def _invoke_guarded(
@@ -327,140 +739,11 @@ def _invoke_guarded(
     budget_purpose: str = "primary",
     **kwargs: Any,
 ) -> T:
-    kwargs = _prepare_request(context, function, kwargs)
-    input_tokens, output_tokens = _request_estimates(context, args, kwargs)
-    model = kwargs.get("model")
-    original_model = model
-    estimated_usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens, source="estimate")
-    estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
-    if kwargs.get("stream") is True and context.config.token.run_token_budget is not None:
-        remaining_budget = (
-            context.config.token.run_token_budget
-            - context.state.total_tokens
-            - context.budget._reserved_tokens
-        )
-        max_reserved_request = int(remaining_budget / (1 + context.config.token.reservation_buffer))
-        remaining_output = max(0, max_reserved_request - input_tokens)
-        if output_tokens > remaining_output:
-            output_tokens = remaining_output
-            estimated_usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens, source="estimate")
-            for parameter in ("max_output_tokens", "max_tokens"):
-                if parameter in kwargs:
-                    kwargs = dict(kwargs)
-                    kwargs[parameter] = output_tokens
-                    break
-            context.state.record(
-                "budget.stream_reservation_capped",
-                estimated_output_tokens=output_tokens,
-                limit=context.config.token.run_token_budget,
-            )
-            estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
-    try:
-        admission = context.admission.acquire(
-            input_tokens + output_tokens,
-            key="|".join(context.scope_key(model=model)),
-            wait=context.config.rate_limit.wait_timeout_seconds,
-        )
-    except RateLimitExceeded:
-        context.state.record(
-            "rate_limit.rejected",
-            reason_code="admission_timeout",
-            waited_seconds=context.config.rate_limit.wait_timeout_seconds,
-        )
-        raise
-    circuit_key = "|".join(context.scope_key(model=model))
-    try:
-        context.circuits.before_call(circuit_key)
-    except BaseException as error:
-        context.state.record("circuit.rejected", reason_code="circuit_open")
-        admission.release()
-        raise
-    try:
-        reservation = context.budget.reserve(input_tokens, output_tokens, estimated_cost, purpose=budget_purpose)
-    except BudgetExceeded as error:
-        admission.release()
-        fallback_model = context.config.degradation.fallback_model
-        can_downgrade = (
-            context.config.token.on_exceeded == "downgrade"
-            and fallback_model
-            and model != fallback_model
-            and error.reason_code in {"run_token_budget", "run_cost_budget", "request_cost_budget"}
-        )
-        if can_downgrade:
-            kwargs = dict(kwargs)
-            kwargs["model"] = fallback_model
-            model = fallback_model
-            input_tokens, output_tokens = _request_estimates(context, args, kwargs)
-            estimated_usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens, source="estimate")
-            estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
-            try:
-                reservation = context.budget.reserve(
-                    input_tokens, output_tokens, estimated_cost, purpose="fallback"
-                )
-            except BudgetExceeded:
-                context.state.record("budget.rejected", reason_code=error.reason_code, action="downgrade", retryable=error.retryable)
-                raise error
-            context.state.record(
-                "budget.downgraded",
-                from_model=original_model,
-                to_model=fallback_model,
-                reason_code=error.reason_code,
-            )
-        else:
-            context.state.record(
-                "budget.rejected",
-                reason_code=error.reason_code,
-                action=context.config.token.on_exceeded,
-                retryable=error.retryable,
-            )
-            raise
-    context.state.llm_calls += 1
-    context.state.record("llm.requested", estimated_tokens=input_tokens + output_tokens)
-    try:
-        result = function(*args, **kwargs)
-    except BaseException as error:
-        context.circuits.record_failure(circuit_key, error)
-        admission.release()
-        reservation.release()
-        context.state.record("llm.failed")
-        raise
-    if kwargs.get("stream") is True and hasattr(result, "__aiter__"):
-        return _finish_async_stream(context, result, reservation, estimated_usage, model, admission, context.circuits, circuit_key)  # type: ignore[return-value]
-    if kwargs.get("stream") is True and hasattr(result, "__iter__"):
-        return _finish_sync_stream(context, result, reservation, estimated_usage, model, admission, context.circuits, circuit_key)  # type: ignore[return-value]
-    if isawaitable(result):
-        async def finish() -> Any:
-            try:
-                response = await result
-                usage = _resolve_usage(context, estimated_usage, _extract_usage(response), model)
-                actual_cost = context.pricing.estimate(model, usage) or estimated_cost
-                reservation.settle(usage, actual_cost)
-                context.circuits.record_success(circuit_key)
-                admission.release()
-                context.state.record("llm.completed", total_tokens=usage.total_tokens)
-                return response
-            except BaseException as error:
-                context.circuits.record_failure(circuit_key, error)
-                context.circuits.record_failure(circuit_key, error if 'error' in locals() else RuntimeError("call failed"))
-                admission.release()
-                reservation.release()
-                context.state.record("llm.failed")
-                raise
-        return finish()  # type: ignore[return-value]
-    try:
-        usage = _resolve_usage(context, estimated_usage, _extract_usage(result), model)
-        actual_cost = context.pricing.estimate(model, usage) or estimated_cost
-        reservation.settle(usage, actual_cost)
-        context.circuits.record_success(circuit_key)
-        admission.release()
-        context.state.record("llm.completed", total_tokens=usage.total_tokens)
-        return result
-    except BaseException as error:
-        context.circuits.record_failure(circuit_key, error)
-        admission.release()
-        reservation.release()
-        context.state.record("llm.failed")
-        raise
+    prepared = _prepare_call(context, function, args, kwargs)
+    call_context = prepared.call_context
+    admitted = _admit_call(context, prepared, budget_purpose=budget_purpose)
+    result = _start_call(context, function, admitted, call_context)
+    return _dispatch_response(context, result, admitted, call_context)  # type: ignore[return-value]
 
 
 class GuardedProxy:
@@ -487,6 +770,56 @@ class GuardedProxy:
             return GuardedProxy(value, self._guard, path)
         return value
 
+    def __repr__(self) -> str:
+        return repr(self._target)
+
+    def __str__(self) -> str:
+        return str(self._target)
+
+    def __enter__(self) -> Any:
+        enter = getattr(self._target, "__enter__", None)
+        if enter is None:
+            raise TypeError("被包装对象不支持同步上下文管理器")
+        value = enter()
+        return self if value is self._target else value
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> Any:
+        exit_method = getattr(self._target, "__exit__", None)
+        if exit_method is None:
+            raise TypeError("被包装对象不支持同步上下文管理器")
+        return exit_method(exc_type, exc, traceback)
+
+    async def __aenter__(self) -> Any:
+        enter = getattr(self._target, "__aenter__", None)
+        if enter is None:
+            raise TypeError("被包装对象不支持异步上下文管理器")
+        value = await enter()
+        return self if value is self._target else value
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> Any:
+        exit_method = getattr(self._target, "__aexit__", None)
+        if exit_method is None:
+            raise TypeError("被包装对象不支持异步上下文管理器")
+        return await exit_method(exc_type, exc, traceback)
+
+    def __iter__(self):
+        iterator = getattr(self._target, "__iter__", None)
+        if iterator is None:
+            raise TypeError("被包装对象不可迭代")
+        return iterator()
+
+    def __aiter__(self):
+        iterator = getattr(self._target, "__aiter__", None)
+        if iterator is None:
+            raise TypeError("被包装对象不支持异步迭代")
+        return iterator()
+
+    async def __anext__(self):
+        iterator = getattr(self._target, "__anext__", None)
+        if iterator is None:
+            raise TypeError("被包装对象不支持异步迭代")
+        return await iterator()
+
 
 class AgentGuard:
     def __init__(
@@ -496,7 +829,7 @@ class AgentGuard:
         config_manager: ConfigManager | None = None,
     ) -> None:
         if config_manager is not None and (config is not None or config_path is not None):
-            raise ValueError("pass config_manager or config/config_path, not both")
+            raise ValueError("config_manager 与 config/config_path 不能同时传入")
         self._config_manager = config_manager or ConfigManager(config, config_path=config_path)
 
     @property
@@ -538,6 +871,8 @@ class AgentGuard:
         )
 
     def wrap(self, client: Any) -> GuardedProxy:
+        if isinstance(client, GuardedProxy) and client._guard is self:
+            return client
         return GuardedProxy(client, self)
 
     def guard(self, function: Callable[..., T] | None = None, *, name: str | None = None) -> Any:

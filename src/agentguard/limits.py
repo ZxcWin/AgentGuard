@@ -1,4 +1,4 @@
-"""Backward-compatible imports for admission-control policies."""
+"""准入控制策略的向后兼容导入。"""
 
 from .policies.rate_limit import (
     AdmissionController,

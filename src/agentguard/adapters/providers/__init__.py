@@ -1,1 +1,1 @@
-"""Provider-specific adapters are optional and thin."""
+"""供应商专用适配器均为可选依赖，并且只保留薄适配层。"""

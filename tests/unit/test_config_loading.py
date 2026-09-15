@@ -45,7 +45,7 @@ def test_load_config_merges_environment_overrides():
 
 
 def test_unknown_fields_are_rejected():
-    with pytest.raises(ConfigurationError, match="unknown token field"):
+    with pytest.raises(ConfigurationError, match="token.*未知字段"):
         AgentGuardConfig.from_mapping({"token": {"run_buget": 10}})
 
 

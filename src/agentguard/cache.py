@@ -1,4 +1,4 @@
-"""Backward-compatible imports for the in-memory cache adapter."""
+"""内存缓存适配器的向后兼容导入。"""
 
 from .adapters.storage.memory import CacheEntry, MemoryCache, make_cache_key
 

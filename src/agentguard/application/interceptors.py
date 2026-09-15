@@ -12,7 +12,16 @@ class BaseInterceptor:
     def after_response(self, response: Any) -> Any:
         return response
 
+    def on_chunk(self, chunk: Any, context: Any) -> Any:
+        return self.after_response(chunk)
+
     def on_error(self, error: BaseException) -> None:
+        return None
+
+    def on_start(self, context: Any) -> None:
+        return None
+
+    def on_finish(self, context: Any) -> None:
         return None
 
 
@@ -37,6 +46,20 @@ class InterceptorChain:
             current = interceptor.after_response(current)
         return current
 
+    def on_chunk(self, chunk: Any, context: Any) -> Any:
+        current = chunk
+        for interceptor in self.interceptors:
+            current = interceptor.on_chunk(current, context)
+        return current
+
     def on_error(self, error: BaseException) -> None:
         for interceptor in self.interceptors:
             interceptor.on_error(error)
+
+    def on_start(self, context: Any) -> None:
+        for interceptor in self.interceptors:
+            interceptor.on_start(context)
+
+    def on_finish(self, context: Any) -> None:
+        for interceptor in reversed(self.interceptors):
+            interceptor.on_finish(context)

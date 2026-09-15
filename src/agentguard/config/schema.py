@@ -21,11 +21,6 @@ class ModelPriceConfig:
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "ModelPriceConfig":
         values = _mapping(values, "pricing model")
         _check_keys(values, set(cls.__dataclass_fields__), "pricing model")
-        max_scope_keys = _optional_int(values.get("max_scope_keys"), "rate_limit.max_scope_keys")
-        if max_scope_keys is None:
-            max_scope_keys = 10_000
-        if max_scope_keys <= 0:
-            raise ConfigurationError("rate_limit.max_scope_keys must be greater than zero")
         return cls(
             input_per_million=_optional_float(values.get("input_per_million", 0), "pricing.input_per_million") or 0.0,
             output_per_million=_optional_float(values.get("output_per_million", 0), "pricing.output_per_million") or 0.0,
@@ -38,7 +33,7 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
-        raise ConfigurationError(f"{name} must be a mapping")
+        raise ConfigurationError(f"{name} 必须是映射类型")
     return value
 
 
@@ -46,7 +41,7 @@ def _optional_int(value: Any, name: str) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ConfigurationError(f"{name} must be a non-negative integer or None")
+        raise ConfigurationError(f"{name} 必须是非负整数或 None")
     return value
 
 
@@ -54,10 +49,10 @@ def _optional_float(value: Any, name: str) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigurationError(f"{name} must be a non-negative number or None")
+        raise ConfigurationError(f"{name} 必须是非负数或 None")
     result = float(value)
     if result < 0 or not isfinite(result):
-        raise ConfigurationError(f"{name} must be a finite non-negative number or None")
+        raise ConfigurationError(f"{name} 必须是有限的非负数或 None")
     return result
 
 
@@ -65,14 +60,14 @@ def _bounded_float(value: Any, name: str, default: float) -> float:
     result = _optional_float(default if value is None else value, name)
     assert result is not None
     if not 0 <= result <= 1:
-        raise ConfigurationError(f"{name} must be between 0 and 1")
+        raise ConfigurationError(f"{name} 必须介于 0 和 1 之间")
     return result
 
 
 def _check_keys(values: Mapping[str, Any], allowed: set[str], name: str) -> None:
     unknown = sorted(set(values) - allowed)
     if unknown:
-        raise ConfigurationError(f"unknown {name} field(s): {', '.join(unknown)}")
+        raise ConfigurationError(f"{name} 存在未知字段：{', '.join(unknown)}")
 
 
 SCOPE_FIELDS = (
@@ -90,12 +85,12 @@ def _scope_fields(value: Any, name: str, default: tuple[str, ...]) -> tuple[str,
     if value is None:
         return default
     if not isinstance(value, (list, tuple)) or not value:
-        raise ConfigurationError(f"{name} must be a non-empty list of scope fields")
+        raise ConfigurationError(f"{name} 必须是非空的 scope 字段列表")
     fields = tuple(value)
     if any(not isinstance(item, str) or item not in SCOPE_FIELDS for item in fields):
-        raise ConfigurationError(f"{name} contains an unsupported scope field")
+        raise ConfigurationError(f"{name} 包含不支持的 scope 字段")
     if len(set(fields)) != len(fields):
-        raise ConfigurationError(f"{name} must not contain duplicate scope fields")
+        raise ConfigurationError(f"{name} 不能包含重复的 scope 字段")
     return fields
 
 
@@ -127,13 +122,13 @@ class TokenConfig:
             missing_price=str(values.get("missing_price", "observe")),
         )
         if config.on_exceeded not in {"reject", "downgrade", "stop_stream"}:
-            raise ConfigurationError("token.on_exceeded must be reject, downgrade, or stop_stream")
+            raise ConfigurationError("token.on_exceeded 必须是 reject、downgrade 或 stop_stream")
         if config.missing_usage not in {"estimate", "unknown", "reject"}:
-            raise ConfigurationError("token.missing_usage must be estimate, unknown, or reject")
+            raise ConfigurationError("token.missing_usage 必须是 estimate、unknown 或 reject")
         if config.usage_mismatch not in {"observe", "reject"}:
-            raise ConfigurationError("token.usage_mismatch must be observe or reject")
+            raise ConfigurationError("token.usage_mismatch 必须是 observe 或 reject")
         if config.missing_price not in {"observe", "reject"}:
-            raise ConfigurationError("token.missing_price must be observe or reject")
+            raise ConfigurationError("token.missing_price 必须是 observe 或 reject")
         return config
 
 
@@ -160,6 +155,11 @@ class BudgetConfig:
 
 @dataclass(frozen=True)
 class RateLimitConfig:
+    backend: str = "memory"
+    redis_url: str | None = None
+    redis_failure_policy: str = "reject"
+    redis_prefix: str = "agentguard"
+    redis_window_seconds: int = 60
     rpm: int | None = None
     tpm: int | None = None
     max_concurrency: int | None = None
@@ -172,12 +172,32 @@ class RateLimitConfig:
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "RateLimitConfig":
         values = _mapping(values, "rate_limit")
         _check_keys(values, set(cls.__dataclass_fields__), "rate_limit")
+        backend = str(values.get("backend", "memory"))
+        redis_url = values.get("redis_url")
+        if redis_url is not None and (not isinstance(redis_url, str) or not redis_url.strip()):
+            raise ConfigurationError("rate_limit.redis_url 必须是非空字符串或 None")
+        redis_failure_policy = str(values.get("redis_failure_policy", "reject"))
+        redis_prefix = str(values.get("redis_prefix", "agentguard"))
+        redis_window_seconds = _optional_int(values.get("redis_window_seconds", 60), "rate_limit.redis_window_seconds")
+        if backend not in {"memory", "redis"}:
+            raise ConfigurationError("rate_limit.backend 必须是 memory 或 redis")
+        if redis_failure_policy not in {"reject", "memory"}:
+            raise ConfigurationError("rate_limit.redis_failure_policy 必须是 reject 或 memory")
+        if not redis_prefix.strip() or redis_window_seconds is None or redis_window_seconds <= 0:
+            raise ConfigurationError("rate_limit 的 Redis 配置无效")
+        if backend == "redis" and not redis_url:
+            raise ConfigurationError("backend 为 redis 时必须配置 rate_limit.redis_url")
         max_scope_keys = _optional_int(values.get("max_scope_keys"), "rate_limit.max_scope_keys")
         if max_scope_keys is None:
             max_scope_keys = 10_000
         if max_scope_keys <= 0:
-            raise ConfigurationError("rate_limit.max_scope_keys must be greater than zero")
+            raise ConfigurationError("rate_limit.max_scope_keys 必须大于 0")
         return cls(
+            backend=backend,
+            redis_url=redis_url,
+            redis_failure_policy=redis_failure_policy,
+            redis_prefix=redis_prefix,
+            redis_window_seconds=redis_window_seconds,
             rpm=_optional_int(values.get("rpm"), "rate_limit.rpm"),
             tpm=_optional_int(values.get("tpm"), "rate_limit.tpm"),
             max_concurrency=_optional_int(values.get("max_concurrency"), "rate_limit.max_concurrency"),
@@ -201,7 +221,7 @@ class PricingConfig:
         _check_keys(values, {"version", "models"}, "pricing")
         version = values.get("version", "1")
         if not isinstance(version, str) or not version.strip():
-            raise ConfigurationError("pricing.version must be a non-empty string")
+            raise ConfigurationError("pricing.version 必须是非空字符串")
         models = _mapping(values.get("models"), "pricing.models")
         return cls(version=version, models={
             str(model): ModelPriceConfig.from_mapping(price)
@@ -219,7 +239,7 @@ class DegradationConfig:
         _check_keys(values, set(cls.__dataclass_fields__), "degradation")
         fallback_model = values.get("fallback_model")
         if fallback_model is not None and (not isinstance(fallback_model, str) or not fallback_model.strip()):
-            raise ConfigurationError("degradation.fallback_model must be a non-empty string or None")
+            raise ConfigurationError("degradation.fallback_model 必须是非空字符串或 None")
         return cls(fallback_model=fallback_model)
 
 
@@ -234,7 +254,7 @@ class TelemetryConfig:
         _check_keys(values, set(cls.__dataclass_fields__), "telemetry")
         for key in cls.__dataclass_fields__:
             if key in values and not isinstance(values[key], bool):
-                raise ConfigurationError(f"telemetry.{key} must be a boolean")
+                raise ConfigurationError(f"telemetry.{key} 必须是布尔值")
         return cls(
             verbose=values.get("verbose", True),
             enable_metrics_export=values.get("enable_metrics_export", False),
@@ -257,9 +277,9 @@ class AgentGuardConfig:
         _check_keys(values, {"schema_version", "token", "budget", "pricing", "degradation", "rate_limit", "telemetry"}, "configuration")
         schema_version = values.get("schema_version", SCHEMA_VERSION)
         if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-            raise ConfigurationError("schema_version must be an integer")
+            raise ConfigurationError("schema_version 必须是整数")
         if schema_version != SCHEMA_VERSION:
-            raise ConfigurationError(f"unsupported schema_version: {schema_version}")
+            raise ConfigurationError(f"不支持的 schema_version：{schema_version}")
         return cls(
             schema_version=schema_version,
             token=TokenConfig.from_mapping(values.get("token")),
