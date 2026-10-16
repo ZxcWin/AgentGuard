@@ -1,4 +1,5 @@
 import ast
+from importlib.util import resolve_name
 from pathlib import Path
 
 
@@ -12,7 +13,11 @@ def imported_modules(path: Path) -> set[str]:
         if isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            modules.add(node.module)
+            if node.level:
+                package = ".".join(("agentguard", *path.parent.relative_to(PACKAGE_ROOT).parts))
+                modules.add(resolve_name("." * node.level + node.module, package))
+            else:
+                modules.add(node.module)
     return modules
 
 

@@ -6,6 +6,10 @@ class ConfigurationError(AgentGuardError, ValueError):
     """配置值无效时抛出。"""
 
 
+class PolicyVersionConflict(AgentGuardError, ValueError):
+    """A policy update lost its compare-and-swap race."""
+
+
 class BudgetExceeded(AgentGuardError):
     """Token 或成本预算无法覆盖请求时抛出。"""
 
@@ -23,10 +27,20 @@ class CircuitOpen(AgentGuardError):
     """熔断器处于打开状态时抛出。"""
 
 
+class ExecutionTimeout(AgentGuardError, TimeoutError):
+    """A configured monotonic execution deadline was reached."""
+
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
+        self.reason_code = f"{scope}_timeout"
+        super().__init__(f"{scope} execution deadline exceeded")
+
+
 __all__ = [
     "AgentGuardError",
     "BudgetExceeded",
     "CircuitOpen",
     "ConfigurationError",
+    "ExecutionTimeout",
     "RateLimitExceeded",
 ]

@@ -1,0 +1,41 @@
+<script setup lang="ts">
+import { onMounted, onUnmounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
+import { ShieldCheck, LayoutDashboard, ListTree, SlidersHorizontal, PlugZap, ChevronDown, ArrowUpRight, CircleHelp, PanelLeftClose, RefreshCw, Menu, X, CircleDot } from 'lucide-vue-next'
+import { apiDocsUrl } from './api'
+import { useModal } from './useModal'
+import { checkHealth, health, connectionError, refreshKey } from './state'
+const route = useRoute()
+const nav = [{ path: '/', name: '运行概览', icon: LayoutDashboard }, { path: '/runs', name: '运行记录', icon: ListTree }, { path: '/policies', name: '防护策略', icon: SlidersHorizontal }, { path: '/settings', name: '接入设置', icon: PlugZap }]
+const menu = ref(false)
+const help = ref(false)
+const helpTrigger = ref<HTMLElement | null>(null)
+const helpPanel = ref<HTMLElement | null>(null)
+const helpKeydown = useModal(helpPanel, help, () => { help.value = false }, helpTrigger)
+const navPanel = ref<HTMLElement | null>(null)
+const navTrigger = ref<HTMLElement | null>(null)
+const navKeydown = useModal(navPanel, menu, () => { menu.value = false }, navTrigger)
+let timer: ReturnType<typeof setInterval>
+onMounted(() => { checkHealth(); timer = setInterval(checkHealth, 30000) })
+onUnmounted(() => clearInterval(timer))
+async function refresh() { await checkHealth(); refreshKey.value++ }
+</script>
+<template>
+  <div class="app-shell">
+    <button v-if="menu" class="nav-backdrop" aria-label="关闭导航" @click="menu = false"></button>
+    <aside ref="navPanel" class="sidebar" :inert="help" :class="{ open: menu }" @keydown="navKeydown">
+      <RouterLink class="brand" to="/"><span class="brand-symbol"><ShieldCheck :size="23"/></span><span>AgentGuard<span class="brand-edition">CONSOLE</span></span></RouterLink>
+      <RouterLink to="/settings" class="workspace" @click="menu = false"><span class="workspace-avatar">AG</span><span><strong>本地工作空间</strong><small>Local workspace</small></span><ChevronDown :size="15"/></RouterLink>
+      <div class="nav-label">工作空间</div>
+      <nav><RouterLink v-for="item in nav" :key="item.path" :to="item.path" class="nav-item" :class="{ active: route.path === item.path }" @click="menu = false"><component :is="item.icon" :size="18"/><span>{{ item.name }}</span><span v-if="route.path === item.path" class="active-dot"></span></RouterLink></nav>
+      <div class="sidebar-bottom"><div class="runtime-note"><span class="small-shield"><ShieldCheck :size="19"/></span><strong>运行时防护</strong><span class="status-dot" :class="{ offline: !health }"></span><small>{{ health ? '本地服务已连接' : '等待服务连接' }}</small></div><button ref="helpTrigger" class="support-link" @click="help = true"><CircleHelp :size="17"/>文档与帮助<ArrowUpRight :size="14"/></button><div class="sidebar-footer"><span class="avatar">L</span><span>本地开发环境<small>SDK v{{ health?.sdk_version || '0.1.0' }}</small></span><PanelLeftClose :size="16"/></div></div>
+    </aside>
+    <div class="main-shell" :inert="help || menu"><header class="topbar"><div class="breadcrumbs"><button ref="navTrigger" class="icon-button mobile-menu" title="展开导航" @click="menu = true"><Menu :size="20"/></button><span>工作空间</span><span class="breadcrumb-slash">/</span><strong>{{ route.meta.title }}</strong></div><div class="topbar-right"><span class="connection"><span class="status-dot" :class="{ offline: !health }"></span>{{ health ? '服务在线' : '连接断开' }}</span><span class="top-divider"></span><span class="environment"><CircleDot :size="12"/>本地环境</span><span class="avatar">L</span></div></header>
+      <div v-if="health?.demo" class="demo-banner"><span><span class="status-dot"></span>演示环境 · 本地示例数据</span><RouterLink to="/settings">查看连接信息<ArrowUpRight :size="13"/></RouterLink></div>
+      <div v-if="connectionError" class="connection-banner" role="alert">无法连接 AgentGuard 服务：{{ connectionError }}<button @click="refresh"><RefreshCw :size="14"/>重新连接</button></div>
+      <main><RouterView :key="route.path"/></main>
+      <footer class="page-footer"><span><ShieldCheck :size="13"/>AgentGuard <span class="muted">/</span> Runtime governance for AI agents</span><span>本地工作空间 · API v{{ health?.api_version || '1' }}</span></footer>
+    </div>
+    <div v-if="help" class="modal-overlay" @click.self="help = false"><section ref="helpPanel" class="help-modal" @keydown="helpKeydown" role="dialog" aria-modal="true" aria-labelledby="help-title"><button class="icon-button modal-close" title="关闭" @click="help = false"><X :size="18"/></button><ShieldCheck :size="30" class="green"/><h2 id="help-title">AgentGuard 文档</h2><p>项目根目录的 README.md 包含安装、SDK 接入和运行说明。控制台接口定义可在本地服务的 API 文档中查看。</p><a class="button primary" :href="apiDocsUrl" target="_blank" rel="noreferrer">打开 API 文档<ArrowUpRight :size="15"/></a></section></div>
+  </div>
+</template>

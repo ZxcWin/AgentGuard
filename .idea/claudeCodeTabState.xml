@@ -6,27 +6,16 @@
         <entry key="0">
           <value>
             <TabSessionState>
+              <option name="projectPath" value="D:\Project\Zxc\AgentGuard" />
               <option name="provider" value="codex" />
-              <option name="sessionId" value="01a0665f-5441-70f3-a443-884082199c4f" />
-              <option name="cwd" value="$PROJECT_DIR$" />
-              <option name="model" value="gpt-5.6-sol" />
-              <option name="permissionMode" value="bypassPermissions" />
-            </TabSessionState>
-          </value>
-        </entry>
-        <entry key="1">
-          <value>
-            <TabSessionState>
-              <option name="provider" value="codex" />
-              <option name="sessionId" value="01a06b60-d431-7912-b0e8-2bcc53984f40" />
-              <option name="cwd" value="$PROJECT_DIR$" />
-              <option name="model" value="gpt-5.6-sol" />
+              <option name="sessionId" value="01a13e86-1932-71c3-9d44-547ed3be2f31" />
+              <option name="cwd" value="D:\Project\Zxc\AgentGuard" />
+              <option name="model" value="gpt-6.1-sol" />
               <option name="permissionMode" value="bypassPermissions" />
             </TabSessionState>
           </value>
         </entry>
       </map>
     </option>
-    <option name="tabCount" value="2" />
   </component>
 </project>

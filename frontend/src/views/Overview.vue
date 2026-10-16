@@ -1,0 +1,45 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import { Activity, ArrowUpRight, Coins, Layers3, RefreshCw, ShieldCheck, ShieldAlert, Zap, ChevronRight, Clock3, ArrowRight, Plus } from 'lucide-vue-next'
+import { api, number, money, sourceName, statusName, dateTime, type OverviewData, type Page, type Run } from '../api'
+import { health, refreshKey } from '../state'
+import { useResource } from '../useResource'
+import ActivityChart from '../components/ActivityChart.vue'
+import ResourceState from '../components/ResourceState.vue'
+const hours = ref(24)
+const model = ref('')
+const metric = ref<'calls' | 'tokens'>('calls')
+const creating = ref(false)
+const actionError = ref('')
+const { data, loading, error, reload } = useResource(async signal => {
+  const [overview, recent] = await Promise.all([api<OverviewData>(`/overview?hours=${hours.value}&model=${encodeURIComponent(model.value)}`, { signal }), api<Page<Run>>(`/runs?hours=${hours.value}&page_size=5`, { signal })])
+  return { overview, recent }
+}, [hours, model])
+const overview = computed(() => data.value?.overview)
+const failureRate = computed(() => overview.value?.runs ? (overview.value.failed / overview.value.runs * 100).toFixed(1) : '0.0')
+const sources = computed(() => Object.entries(overview.value?.sources || {}).filter(([, count]) => count > 0))
+async function createExample(scenario = 'standard') {
+  creating.value = true; actionError.value = ''
+  try { await api('/demo/runs?scenario=' + scenario, { method: 'POST' }); refreshKey.value++ }
+  catch (reason) { actionError.value = reason instanceof Error ? reason.message : '生成失败' }
+  finally { creating.value = false }
+}
+</script>
+<template>
+  <div class="page-heading"><div><div class="eyebrow">WORKSPACE OVERVIEW</div><h1>运行概览</h1><p>掌握 Agent 的每一次调用，让运行始终可控。</p></div><div class="heading-actions"><select v-model="model" aria-label="模型筛选"><option value="">全部模型</option><option v-for="item in overview?.models || []" :key="item" :value="item">{{ item }}</option></select><label class="sr-only" for="overview-hours">时间范围</label><select id="overview-hours" v-model.number="hours"><option :value="1">最近 1 小时</option><option :value="24">最近 24 小时</option><option :value="168">最近 7 天</option></select><button class="button square" title="刷新概览" :disabled="loading" @click="reload"><RefreshCw :size="16" :class="{ spin: loading }"/></button></div></div>
+  <ResourceState v-if="loading || error" :loading="loading" :error="error" @retry="reload"/>
+  <template v-else-if="overview">
+    <section class="guard-banner"><span class="guard-banner-icon"><ShieldCheck :size="25"/></span><div><strong>每一次调用，都有边界。</strong><p>预算、限流与工具调用限制，为你的 Agent 提供运行时防护。</p></div><RouterLink to="/policies">管理防护策略<ArrowRight :size="16"/></RouterLink></section>
+    <div class="metric-grid">
+      <article class="metric-card"><div class="metric-label">模型调用<span class="metric-icon"><Activity :size="17"/></span></div><div class="metric-value">{{ number(overview.calls) }}<small>次</small></div><div class="metric-foot"><span class="tiny-dot green-bg"></span>来自 {{ number(overview.runs) }} 次 Agent 运行</div></article>
+      <article class="metric-card"><div class="metric-label">Token 消耗<span class="metric-icon"><Layers3 :size="17"/></span></div><div class="metric-value">{{ number(overview.tokens) }}<small>tokens</small></div><div class="metric-foot"><span class="source-mini">{{ sources.length === 1 ? sourceName(sources[0]![0]) : sources.length ? '混合来源' : '暂无数据' }}</span>保留 Usage 来源信息</div></article>
+      <article class="metric-card"><div class="metric-label">估算成本<span class="metric-icon"><Coins :size="17"/></span></div><div class="metric-value">{{ money(overview.estimated_cost_usd) }}<small>USD</small></div><div class="metric-foot"><span v-if="overview.missing_price_runs" class="amber">{{ overview.missing_price_runs }} 次运行缺少价格</span><span v-else>按配置价格估算</span><span class="muted">· 非计费账单</span></div></article>
+      <article class="metric-card"><div class="metric-label">防护拦截<span class="metric-icon amber"><ShieldAlert :size="17"/></span></div><div class="metric-value">{{ number(overview.blocked) }}<small>次</small></div><div class="metric-foot"><span :class="overview.failed ? 'amber' : 'green'">{{ failureRate }}% 运行失败率</span><span class="muted">{{ overview.failed }} 次失败</span></div></article>
+    </div>
+    <section class="card trend-card"><div class="card-heading"><div><h2>调用趋势<span class="subtle-tag">{{ hours === 168 ? '7 天' : hours + ' 小时' }}</span></h2><p>观察模型调用与 Token 消耗随时间的变化</p></div><div class="segmented"><button :class="{ selected: metric === 'calls' }" @click="metric = 'calls'">调用次数</button><button :class="{ selected: metric === 'tokens' }" @click="metric = 'tokens'">Token 消耗</button></div></div><div class="chart-legend"><span class="tiny-dot green-bg"></span>{{ metric === 'calls' ? '模型调用' : 'Token 消耗' }}<span class="muted">· 按浏览器本地时区展示</span></div><ActivityChart :series="overview.series" :metric="metric"/><div class="chart-bottom"><span><Clock3 :size="13"/>最近 {{ hours === 168 ? '7 天' : hours + ' 小时' }}的运行数据</span><span><span class="tiny-dot green-bg"></span>SQLite 本地存储</span></div></section>
+    <div class="overview-bottom-grid"><section class="card agents-card"><div class="card-heading"><div><h2>活跃 Agents</h2><p>按运行次数排序</p></div><Zap :size="17" class="muted"/></div><div v-if="!overview.agents.length" class="small-empty">接入后查看 Agent 的运行表现</div><div v-for="(agent, index) in overview.agents.slice(0, 4)" :key="agent.name" class="agent-row"><span class="agent-icon" :class="'tone-' + index"><Layers3 :size="17"/></span><div class="agent-info"><strong>{{ agent.name }}</strong><small>{{ number(agent.runs) }} 次运行 <span>·</span> {{ number(agent.tokens) }} tokens</small></div><div class="agent-cost">{{ money(agent.cost) }}<small>{{ agent.failed ? agent.failed + ' 次失败' : '运行正常' }}</small></div></div><div class="card-footer"><span>{{ overview.agents.length }} 个活跃 Agent</span><RouterLink to="/runs">查看运行<ChevronRight :size="14"/></RouterLink></div></section>
+    <section class="card usage-card"><div class="card-heading"><div><h2>数据与防护</h2><p>清晰了解指标的来源与边界</p></div><ShieldCheck :size="18" class="green"/></div><div class="source-summary"><span>Usage 数据来源</span><strong>{{ number(overview.runs) }} 次运行</strong></div><div class="source-bar"><div v-for="([source, count], index) in sources" :key="source" :style="{ width: count / Math.max(1, overview.runs) * 100 + '%', opacity: 1 - index * .2 }"></div></div><div class="source-list"><span v-for="[source, count] in sources" :key="source"><span class="tiny-dot green-bg"></span>{{ sourceName(source) }}<strong>{{ number(count) }}</strong></span><span v-if="!sources.length" class="muted">暂无 Usage 数据</span></div><div class="privacy-note"><ShieldCheck :size="17"/><div><strong>只记录运行元数据</strong><p>默认不采集 Prompt、工具参数和输出原文。</p></div></div><RouterLink class="text-link usage-link" to="/settings">了解数据接入<ArrowUpRight :size="14"/></RouterLink></section></div>
+    <section class="card recent-card"><div class="card-heading"><div><h2>最近运行</h2><p>从一次运行，追踪每一个关键事件</p></div><RouterLink class="text-link" to="/runs">全部运行<ArrowRight :size="15"/></RouterLink></div><div class="table-scroll" v-if="data?.recent.items.length"><table><thead><tr><th>Agent / Run ID</th><th>状态</th><th>模型调用</th><th>Token 消耗</th><th>估算成本</th><th>开始时间</th><th></th></tr></thead><tbody><tr v-for="run in data.recent.items" :key="run.run_id"><td><RouterLink :to="'/runs?run=' + run.run_id" class="run-name">{{ run.agent_name }}</RouterLink><small class="mono muted run-id">{{ run.run_id.slice(0, 18) }}…</small></td><td><span class="status-badge" :class="run.status"><span class="tiny-dot"></span>{{ statusName(run.status) }}</span></td><td class="tabular">{{ run.llm_calls }}</td><td class="tabular">{{ number(run.total_tokens) }}</td><td class="tabular">{{ run.cost_known ? money(run.estimated_cost_usd) : '价格缺失' }}</td><td class="muted nowrap">{{ dateTime(run.started_at) }}</td><td><RouterLink :to="'/runs?run=' + run.run_id" class="icon-button" :aria-label="'查看 ' + run.agent_name"><ArrowUpRight :size="16"/></RouterLink></td></tr></tbody></table></div><ResourceState v-else empty/></section>
+    <div v-if="health?.demo" class="demo-action"><span>想看看新调用如何进入控制台？</span><button class="text-link" :disabled="creating" @click="createExample()"><Plus :size="14"/>{{ creating ? '正在生成…' : '生成一次本地示例运行' }}</button><button class="text-link" :disabled="creating" title="首次请求模拟连接失败，按当前重试策略执行" @click="createExample('retry')"><RefreshCw :size="14"/>生成一次重试示例</button><span v-if="actionError" role="alert" class="danger">{{ actionError }}</span></div>
+  </template>
+</template>

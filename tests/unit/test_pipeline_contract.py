@@ -97,7 +97,7 @@ def test_budget_rejection_releases_admission_before_provider_call():
 
     assert error.value.reason_code == "run_token_budget"
     assert run.budget._reserved_tokens == 0
-    assert run.admission._states == {}
+    assert all(concurrency._active == 0 for _, concurrency in run.admission._states.values())
 
 
 def test_interceptor_can_short_circuit_before_provider():
@@ -160,7 +160,7 @@ def test_async_cancellation_releases_call_resources_and_finishes_once():
 
     run = asyncio.run(consume())
     assert run.budget._reserved_tokens == 0
-    assert [item[0] for item in interceptor.calls] == ["start", "error", "finish"]
+    assert [item[0] for item in interceptor.calls] == ["before", "start", "error", "finish"]
 
 
 def test_sync_stream_passes_each_chunk_through_interceptors_and_finishes_once():

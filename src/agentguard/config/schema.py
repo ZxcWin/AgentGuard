@@ -50,7 +50,10 @@ def _optional_float(value: Any, name: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigurationError(f"{name} 必须是非负数或 None")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise ConfigurationError(f"{name} must be a finite nonnegative number") from error
     if result < 0 or not isfinite(result):
         raise ConfigurationError(f"{name} 必须是有限的非负数或 None")
     return result
@@ -229,9 +232,48 @@ class PricingConfig:
         })
 
 
+MODEL_CAPABILITIES = {"text", "tools", "json_object", "json_schema", "vision", "audio", "streaming"}
+DATA_CLASSIFICATIONS = ("public", "internal", "confidential", "restricted")
+
+
+def _string_list(value: Any, name: str, allowed: set[str] | None = None) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) or not item.strip() or item != item.strip() for item in value
+    ):
+        raise ConfigurationError(f"{name} 必须是非空字符串组成的列表")
+    if len(set(value)) != len(value) or (allowed is not None and set(value) - allowed):
+        raise ConfigurationError(f"{name} 包含重复或不支持的值")
+    return tuple(value)
+
+
+@dataclass(frozen=True)
+class ModelCapabilityConfig:
+    capabilities: tuple[str, ...] = ("text",)
+    regions: tuple[str, ...] = ()
+    max_data_classification: str = "public"
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "ModelCapabilityConfig":
+        values = _mapping(values, "model profile")
+        _check_keys(values, set(cls.__dataclass_fields__), "model profile")
+        classification = values.get("max_data_classification", "public")
+        if classification not in DATA_CLASSIFICATIONS:
+            raise ConfigurationError("max_data_classification 必须是 public/internal/confidential/restricted")
+        return cls(
+            capabilities=_string_list(values.get("capabilities", ["text"]), "capabilities", MODEL_CAPABILITIES),
+            regions=_string_list(values.get("regions", []), "regions"),
+            max_data_classification=classification,
+        )
+
+
 @dataclass(frozen=True)
 class DegradationConfig:
     fallback_model: str | None = None
+    model_profiles: Mapping[str, ModelCapabilityConfig] = field(default_factory=dict)
+    required_capabilities: tuple[str, ...] = ()
+    allowed_regions: tuple[str, ...] = ()
+    data_classification: str = "public"
+    max_cost_usd: float | None = None
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "DegradationConfig":
@@ -240,7 +282,20 @@ class DegradationConfig:
         fallback_model = values.get("fallback_model")
         if fallback_model is not None and (not isinstance(fallback_model, str) or not fallback_model.strip()):
             raise ConfigurationError("degradation.fallback_model 必须是非空字符串或 None")
-        return cls(fallback_model=fallback_model)
+        profiles = _mapping(values.get("model_profiles"), "degradation.model_profiles")
+        if any(not isinstance(key, str) or not key.strip() or key != key.strip() for key in profiles):
+            raise ConfigurationError("model profile names must be nonempty strings without surrounding whitespace")
+        classification = values.get("data_classification", "public")
+        if classification not in DATA_CLASSIFICATIONS:
+            raise ConfigurationError("degradation.data_classification 必须是 public/internal/confidential/restricted")
+        return cls(
+            fallback_model=fallback_model,
+            model_profiles={key: ModelCapabilityConfig.from_mapping(profile) for key, profile in profiles.items()},
+            required_capabilities=_string_list(values.get("required_capabilities", []), "degradation.required_capabilities", MODEL_CAPABILITIES),
+            allowed_regions=_string_list(values.get("allowed_regions", []), "degradation.allowed_regions"),
+            data_classification=classification,
+            max_cost_usd=_optional_float(values.get("max_cost_usd"), "degradation.max_cost_usd"),
+        )
 
 
 @dataclass(frozen=True)
@@ -262,6 +317,85 @@ class TelemetryConfig:
 
 
 @dataclass(frozen=True)
+class RetryConfig:
+    max_retries: int = 0
+    initial_delay_seconds: float = 0.5
+    max_delay_seconds: float = 10.0
+    max_elapsed_seconds: float = 30.0
+    jitter: bool = True
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "RetryConfig":
+        values = _mapping(values, "retry")
+        _check_keys(values, set(cls.__dataclass_fields__), "retry")
+        count = _optional_int(values.get("max_retries", 0), "retry.max_retries")
+        if count is None or count > 10:
+            raise ConfigurationError("retry.max_retries must be between 0 and 10")
+        delays = {key: _optional_float(values.get(key, default), f"retry.{key}")
+                  for key, default in (("initial_delay_seconds", .5), ("max_delay_seconds", 10.0), ("max_elapsed_seconds", 30.0))}
+        if any(value is None for value in delays.values()) or delays["max_elapsed_seconds"] <= 0:
+            raise ConfigurationError("retry delays must be finite numbers and max_elapsed_seconds must be positive")
+        if delays["initial_delay_seconds"] > delays["max_delay_seconds"]:
+            raise ConfigurationError("retry.initial_delay_seconds cannot exceed max_delay_seconds")
+        jitter = values.get("jitter", True)
+        if not isinstance(jitter, bool):
+            raise ConfigurationError("retry.jitter must be a boolean")
+        return cls(max_retries=count, jitter=jitter, **delays)
+
+
+@dataclass(frozen=True)
+class TimeoutConfig:
+    run_seconds: float | None = None
+    llm_seconds: float | None = None
+    tool_seconds: float | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "TimeoutConfig":
+        values = _mapping(values, "timeout")
+        _check_keys(values, set(cls.__dataclass_fields__), "timeout")
+        return cls(**{key: _optional_float(values.get(key), f"timeout.{key}") for key in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True)
+class ToolConfig:
+    max_calls: int | None = None
+    max_steps: int | None = None
+    max_repeated_calls: int | None = None
+    per_tool_limits: Mapping[str, int] = field(default_factory=dict)
+    side_effects: Mapping[str, str] = field(default_factory=dict)
+    idempotency_required_for: tuple[str, ...] = ()
+    approval_required_for: tuple[str, ...] = ()
+    approval_timeout_seconds: float | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "ToolConfig":
+        values = _mapping(values, "tools")
+        _check_keys(values, set(cls.__dataclass_fields__), "tools")
+        limits = _mapping(values.get("per_tool_limits"), "tools.per_tool_limits")
+        effects = _mapping(values.get("side_effects"), "tools.side_effects")
+        if any(not isinstance(key, str) or not key.strip() for key in (*limits, *effects)):
+            raise ConfigurationError("tools names must be nonempty strings")
+        checked_limits = {key: _optional_int(value, f"tools.per_tool_limits.{key}") for key, value in limits.items()}
+        if any(value is None for value in checked_limits.values()):
+            raise ConfigurationError("per-tool limits must be nonnegative integers")
+        if any(not isinstance(value, str) or value not in {"read", "write", "irreversible"} for value in effects.values()):
+            raise ConfigurationError("tool side effects must be read, write, or irreversible")
+        def tool_names(value: Any, name: str) -> tuple[str, ...]:
+            if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) or not item.strip() or item != item.strip() for item in value):
+                raise ConfigurationError(f"{name} 必须是工具名字符串列表")
+            if len(set(value)) != len(value):
+                raise ConfigurationError(f"{name} 不能包含重复工具名")
+            return tuple(value)
+        return cls(max_calls=_optional_int(values.get("max_calls"), "tools.max_calls"),
+                   max_steps=_optional_int(values.get("max_steps"), "tools.max_steps"),
+                   max_repeated_calls=_optional_int(values.get("max_repeated_calls"), "tools.max_repeated_calls"),
+                   per_tool_limits=checked_limits, side_effects=dict(effects),
+                   idempotency_required_for=tool_names(values.get("idempotency_required_for", []), "tools.idempotency_required_for"),
+                   approval_required_for=tool_names(values.get("approval_required_for", []), "tools.approval_required_for"),
+                   approval_timeout_seconds=_optional_float(values.get("approval_timeout_seconds"), "tools.approval_timeout_seconds"))
+
+
+@dataclass(frozen=True)
 class AgentGuardConfig:
     schema_version: int = SCHEMA_VERSION
     token: TokenConfig = field(default_factory=TokenConfig)
@@ -270,11 +404,14 @@ class AgentGuardConfig:
     degradation: DegradationConfig = field(default_factory=DegradationConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
+    tools: ToolConfig = field(default_factory=ToolConfig)
+    retry: RetryConfig = field(default_factory=RetryConfig)
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "AgentGuardConfig":
         values = _mapping(values, "configuration root")
-        _check_keys(values, {"schema_version", "token", "budget", "pricing", "degradation", "rate_limit", "telemetry"}, "configuration")
+        _check_keys(values, set(cls.__dataclass_fields__), "configuration")
         schema_version = values.get("schema_version", SCHEMA_VERSION)
         if isinstance(schema_version, bool) or not isinstance(schema_version, int):
             raise ConfigurationError("schema_version 必须是整数")
@@ -288,6 +425,9 @@ class AgentGuardConfig:
             degradation=DegradationConfig.from_mapping(values.get("degradation")),
             rate_limit=RateLimitConfig.from_mapping(values.get("rate_limit")),
             telemetry=TelemetryConfig.from_mapping(values.get("telemetry")),
+            timeout=TimeoutConfig.from_mapping(values.get("timeout")),
+            tools=ToolConfig.from_mapping(values.get("tools")),
+            retry=RetryConfig.from_mapping(values.get("retry")),
         )
 
     @classmethod

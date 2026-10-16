@@ -20,6 +20,7 @@ from .domain.exceptions import (
     CircuitOpen,
     ConfigurationError,
     RateLimitExceeded,
+    ExecutionTimeout,
 )
 from .adapters.storage import MemoryCache, RedisAdmissionBackend, RedisAdmissionController, RedisAdmissionLease, RedisControllerLease, make_cache_key
 from .policies import (
@@ -31,6 +32,7 @@ from .policies import (
     CircuitBreaker,
     CircuitRegistry,
     LoopDetected,
+    ToolApprovalDenied,
     QualityAction,
     QualityGuard,
     QualityResult,
@@ -57,8 +59,10 @@ __all__ = [
     "BudgetExceeded",
     "CircuitOpen",
     "ConfigurationError",
+    "ExecutionTimeout",
     "InterceptorChain",
     "LoopDetected",
+    "ToolApprovalDenied",
     "MemoryCache",
     "RedisAdmissionBackend",
     "RedisAdmissionController",

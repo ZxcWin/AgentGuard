@@ -11,7 +11,7 @@
 供应商调用、响应消费、结算和事件发布阶段。后续阶段继续按此边界逐步拆分，保持公共
 `RunContext.invoke` API 不变。
 
-同步和异步非流式响应共享同一套结算生命周期：先执行响应拦截，再解析实际 usage、结算
+同步和异步非流式响应共享同一套结算生命周期：先捕获原供应商 usage，再执行响应拦截、校验 usage、结算
 预算、记录成功并释放 admission；供应商异常、响应拦截异常、usage 校验异常和异步取消
 都会统一记录失败、调用 `on_error`/`on_finish`，并释放预算预留和 admission，避免资源泄漏。
 
@@ -40,3 +40,11 @@
 `__enter__` 或 `__aenter__` 返回对象自身，代理会改为返回 `GuardedProxy`，确保上下文
 内部的模型调用仍经过保护；若返回其他对象，则保持该返回值不变。代理不承诺
 `isinstance`、对象身份或所有特殊方法都与底层对象完全透明。
+
+`lifecycle.py` 管理模型调用终态、流和待 await 响应的关闭；`tool_calls.py` 管理 Run 工具限额、
+结果结构摘要和副作用事件；`deadlines.py` 使用单调时钟继承更短的 Run/LLM/tool deadline。
+异步 Run 应使用 `async with`；同步超时不抢占线程，异步取消依赖底层协作。
+`retries.py` 编排默认关闭的非流式模型重试：每次独立 admission/reservation，退避时不占槽位；
+异常分类在纯策略 `policies/retry.py`。失败且 usage 不明确时保守计入估算预算。
+工具、流、已执行子工具的尝试和拦截器异常不自动重试。
+具体示例和边界见项目根目录 `docs/RUNTIME.md`。能力约束 fallback 和后台遥测尚未实现。

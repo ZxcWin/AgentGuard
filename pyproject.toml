@@ -14,7 +14,13 @@ dependencies = []
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
+redis = ["redis>=5.0"]
 test = ["pytest>=8.0"]
+console-test = ["pytest>=8.0", "httpx>=0.28", "httpx2>=2.0"]
+console = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+
+[project.scripts]
+agentguard-console = "agentguard.api.http:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

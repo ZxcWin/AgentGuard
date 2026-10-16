@@ -32,12 +32,13 @@ class InterceptorChain:
     def add(self, interceptor: BaseInterceptor) -> None:
         self.interceptors.append(interceptor)
 
-    def before_request(self, request: dict[str, Any]) -> dict[str, Any]:
+    def before_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         current = request
         for interceptor in self.interceptors:
             result = interceptor.before_request(current)
-            if result is not None:
-                current = result
+            if result is None:
+                return None
+            current = result
         return current
 
     def after_response(self, response: Any) -> Any:

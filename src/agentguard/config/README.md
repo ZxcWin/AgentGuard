@@ -21,6 +21,37 @@ pricing:
 
 配置读取失败必须显式报错；运行中的 Run 使用固定快照，不因热更新产生前后不一致。
 
+`ConfigManager(policy_store=SQLitePolicyStore(path))` 可显式使用本地持久策略库。
+首次写入初始化版本，之后以数据库中的策略为准；每次创建 Run 读取快照。
+版本更新在 SQLite 事务内比较预期版本，写入失败不发布新快照。
+这只支持显式连接同一本地数据库的进程，不是网络策略下发。
+
+工具/超时配置示例（默认全部不限制；0 表示禁止）：
+
+```yaml
+timeout:
+  run_seconds: 60
+  llm_seconds: 20
+  tool_seconds: 5
+tools:
+  max_calls: 10
+  max_steps: 10
+  max_repeated_calls: 2
+  per_tool_limits:
+    lookup: 3
+  side_effects:
+    lookup: read
+    send: irreversible
+```
+
+工具重复检查、副作用、协作取消与同步时限的完整语义见 `docs/RUNTIME.md`。
+
+`retry.max_retries` 默认 0 关闭，范围 0–10；`initial_delay_seconds` 默认 0.5，
+`max_delay_seconds` 默认 10，`max_elapsed_seconds` 默认 30，`jitter` 默认 true。
+总时限必须大于 0，初始退避不得超过最大退避；次数与时间字段都不能为 null。
+重试只覆盖非流式模型调用，工具/流不重试。每次重试使用 `purpose="retry"`，
+受 `token.retry_budget_ratio` 与父 Run 硬预算约束，失败的未知 usage 保守计入估算预算。
+
 预算结算异常策略位于 `token` 配置下：
 
 ```yaml

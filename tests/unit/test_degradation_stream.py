@@ -11,7 +11,7 @@ def test_budget_exceeded_can_downgrade_to_configured_fallback_model():
         {
             "token": {"on_exceeded": "downgrade"},
             "budget": {"run_cost_usd": 0.001},
-            "degradation": {"fallback_model": "cheap"},
+            "degradation": {"fallback_model": "cheap", "model_profiles": {"cheap": {"capabilities": ["text"]}}},
             "pricing": {
                 "models": {
                     "expensive": {"input_per_million": 100, "output_per_million": 100},
@@ -46,7 +46,8 @@ def test_sync_stream_settles_only_consumed_estimated_tokens():
 
     assert run.state.output_tokens == 1
     assert run.state.usage_source == "estimate"
-    assert any(event["event"] == "llm.completed" for event in run.state.events)
+    assert any(event["event"] == "llm.failed" for event in run.state.events)
+    assert not any(event["event"] == "llm.completed" for event in run.state.events)
 
 
 def test_sync_stream_stops_when_run_budget_is_exhausted():

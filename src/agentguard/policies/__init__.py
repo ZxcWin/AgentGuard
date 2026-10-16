@@ -2,7 +2,7 @@ from .budget import BudgetManager, BudgetReservation, estimate_tokens
 from .cost import ModelPrice, PricingTable
 from .quality import QualityAction, QualityGuard, QualityResult
 from .rate_limit import AdmissionController, AdmissionLease, CircuitBreaker, CircuitRegistry, RateLimiter
-from .tools import BehaviorFingerprint, LoopDetected, ToolGuard
+from .tools import BehaviorFingerprint, LoopDetected, ToolApprovalDenied, ToolGuard
 
 __all__ = [
     "BehaviorFingerprint",
@@ -13,6 +13,7 @@ __all__ = [
     "CircuitBreaker",
     "CircuitRegistry",
     "LoopDetected",
+    "ToolApprovalDenied",
     "ModelPrice",
     "PricingTable",
     "QualityAction",

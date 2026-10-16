@@ -1,6 +1,6 @@
 # AgentGuard 架构说明
 
-本文档定义 AgentGuard 开源 SDK 的目标架构、模块边界和演进约束。当前仓库仍处于早期骨架阶段，现有的扁平模块是过渡实现；后续开发应按本文档逐步迁移，而不是继续把所有逻辑堆到 `runtime.py`。
+本文档定义 AgentGuard 开源 SDK 的目标架构、模块边界和演进约束。当前已建立分层目录并保留旧模块兼容导出，调用管线继续拆分。可选控制台通过 `api/http.py`、`ports/RunStore`/`PolicyStore` 与 SQLite 适配器连接 SDK，前端独立放在 `frontend/`。本地策略可在显式连接同一 SQLitePolicyStore 的进程间共享，新 Run 读取新版本；后台遥测、远程授权与跨机器治理仍待实现。
 
 ## 1. 设计目标
 

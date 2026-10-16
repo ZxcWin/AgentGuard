@@ -227,7 +227,7 @@ class AdmissionController:
                     self._states.pop(expired_key, None)
                     self._last_used.pop(expired_key, None)
                 else:
-                    raise RateLimitExceeded("准入 scope key 数量已超限")
+                    raise RateLimitExceeded("准入 scope key cardinality 数量已超限")
             state = (RateLimiter(self.config), ConcurrencyLimiter(self.config.max_concurrency))
             self._states[key] = state
             self._last_used[key] = current_time

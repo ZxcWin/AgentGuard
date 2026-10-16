@@ -22,9 +22,29 @@
 
 > **闭源版说明**：闭源商业版的产品边界与部署形态见 [`CLOSED_SOURCE.md`](CLOSED_SOURCE.md)。
 
+## 当前进度（2026-10-16）
+
+已完成 SDK 分层、配置校验/快照、Token/成本预算与预留结算、内存/Redis 准入限流、基础熔断，以及同步/异步/流式调用的生命周期清理。Run 已接入工具总次数、单工具额度、步数、重复调用和副作用等级配置，支持 Run/LLM/tool 三层单调 deadline。
+
+本轮新增 **可运行的本地控制台**：Vue 3 四个页面（运行概览、运行记录/调用树/事件详情、防护策略、接入设置），FastAPI 版本化接口和 SQLite 脱敏运行存储。支持时间/模型筛选、分页、工具/超时策略编辑、策略校验、乐观版本更新、断线重试、键盘操作和手机布局。
+
+快速预览（项目根目录，先安装 Python 3.10+、Node.js 22+）：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[console,console-test,yaml]"
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+.\.venv\Scripts\python.exe -m agentguard.api.http --demo
+```
+
+打开 http://127.0.0.1:8000 。演示数据明确标记，全部来自本地示例调用，不需要供应商密钥。真实数据模式去掉 `--demo`，运行 `examples/console_agent.py` 可验证 SDK → SQLite → 控制台链路。
+
+控制台面向本机和可信局域网开发预览（局域网启动方式见控制台文档）。策略和版本持久保存在 SQLite；独立 SDK 显式连接同一个 `SQLitePolicyStore` 后，新 Run 读取最新版本，已有 Run 保留旧快照。事件在 Run 进入/退出时保存，调用树基于已加载的关联事件。新增默认关闭的非流式模型重试，支持异常分类、指数退避、jitter、Retry-After 和独立预算；工具/流不自动重试。模型降级会检查能力、结构化输出、地域、数据等级和成本约束；工具可要求幂等键和人工审批，审批支持超时、拒绝、取消及脱敏审计。后台上报、跨机器策略下发、远程认证和生产发布仍待后续。异步超时依赖底层协作取消；同步调用只在执行前后检查，不强制中断线程或撤销副作用。完整启动、验证和部署说明见 [控制台文档](frontend/README.md)，运行时示例和限制见 [运行时文档](docs/RUNTIME.md)。
+
 ## 🐍 技术栈
 
-AgentGuard 开源版统一使用 **Python** 实现，不引入 TypeScript、Go 或其他语言作为运行时实现语言。
+AgentGuard 核心 SDK 使用 **Python** 实现；可选本地控制台独立使用 Vue 3 + TypeScript，不影响 SDK 的独立安装和运行。
 
 - **实现语言**：Python；
 - **交付方式**：Python 包，通过 `pip` 安装和升级；
@@ -33,7 +53,7 @@ AgentGuard 开源版统一使用 **Python** 实现，不引入 TypeScript、Go �
 - **可选后端**：内存、Redis、SQLite，以及 Chroma、Qdrant 等 Python 生态适配器；
 - **集成方式**：通过 Python 适配器接入 OpenAI、Anthropic、LangChain、LlamaIndex、FastAPI、Celery、MCP 等工具或框架。
 
-后续新增功能也应优先保持 Python 实现和 Python API 的一致性；闭源控制平面可以独立采用其他技术实现，但不属于本开源 SDK 的实现范围。
+SDK 新功能保持 Python 实现和 Python API 的一致性。控制台前端依赖在 `frontend/package.json` 中单独管理，HTTP 服务通过 `console` extra 可选安装。组织级商业控制平面的范围仍以 `CLOSED_SOURCE.md` 为准。
 
 ## 📖 目录
 
@@ -101,9 +121,9 @@ executor.run(input, callbacks=[GuardCallbackHandler()])
 ### 方式三：Python 装饰器
 
 ```python
-from agentguard import guard
+from agentguard import AgentGuard
 
-@guard(max_cost=0.01)
+@AgentGuard(config={"budget": {"run_cost_usd": 0.01}}).guard
 def my_agent_function(query):
     # 里面可以是任何代码（OpenAI、Anthropic、Requests 等）
     return client.chat.completions.create(...)
@@ -394,11 +414,15 @@ Agent 应用的限流不能只看 RPM。一次请求可能触发多次模型调�
 ### 1. 安装
 
 ```bash
-pip install agentguard
-
-# 使用语义缓存时，额外安装向量库依赖
-pip install "agentguard[cache]"
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+python3 -m pytest
 ```
+
+以上命令在仓库根目录执行，需要 Python 3.10+。`requirements.txt` 安装 YAML、Redis
+客户端和测试依赖；项目本身通过根目录的 `pyproject.toml` 以可编辑模式安装。
+只安装核心 SDK 可执行 `python3 -m pip install -e .`；启用 Redis 后端还需独立运行
+Redis 服务。语义缓存尚未实现，当前没有 `cache` extra。
 
 ### 2. 创建配置文件（可选）
 
@@ -510,9 +534,19 @@ Redis 客户端，需由应用自行注入兼容 client。
 | `degradation` | `fallback_model` | `str` | `None` | 预算不足时使用的备用模型 |
 | `degradation` | `enable_semantic_cache` | `bool` | `False` | 是否启用语义缓存 |
 | `degradation` | `cache_similarity_threshold` | `float` | `0.9` | 语义缓存命中阈值 |
-| `timeout` | `llm_seconds` | `int` | `None` | 单次 LLM 调用超时时间 |
-| `timeout` | `tool_seconds` | `int` | `None` | 单次工具调用超时时间 |
-| `timeout` | `run_seconds` | `int` | `None` | 一次 Agent Run 的总 Deadline |
+| `timeout` | `llm_seconds` | `float` | `None` | 单次 LLM 调用 deadline，包含流式消费 |
+| `timeout` | `tool_seconds` | `float` | `None` | 单次工具调用 deadline |
+| `timeout` | `run_seconds` | `float` | `None` | 一次 Agent Run 的总 deadline |
+| `tools` | `max_calls` | `int` | `None` | 每个 Run 的总工具次数 |
+| `tools` | `max_steps` | `int` | `None` | 每个 Run 的工具步骤上限；当前每次准入算一步 |
+| `tools` | `max_repeated_calls` | `int` | `None` | 同工具和规范化参数的重复次数上限 |
+| `tools` | `per_tool_limits` | `dict[str, int]` | `{}` | 按工具名设置 Run 内次数上限 |
+| `tools` | `side_effects` | `dict[str, str]` | `{}` | `read/write/irreversible`，未标注默认为 write |
+| `retry` | `max_retries` | `int` | `0` | 非流式模型额外尝试次数，0 关闭，最多 10 次 |
+| `retry` | `initial_delay_seconds` | `float` | `0.5` | 指数退避的初始等待 |
+| `retry` | `max_delay_seconds` | `float` | `10` | 退避上限，Retry-After 超过时停止 |
+| `retry` | `max_elapsed_seconds` | `float` | `30` | 包含首次请求和等待的总时限，必须大于 0 |
+| `retry` | `jitter` | `bool` | `True` | 在当前退避上限内随机等待 |
 | `telemetry` | `verbose` | `bool` | `True` | 是否打印详细守护日志 |
 | `telemetry` | `enable_metrics_export` | `bool` | `False` | 是否导出 Prometheus 指标 |
 
@@ -653,27 +687,33 @@ AgentGuard 不应只关注“模型调用花了多少钱”，还可以逐步覆
 
 ## 🗺️ 路线图
 
-路线图按“先保证运行时控制，再建设治理平台”的顺序推进。复选框表示当前 README 规划状态，实际完成情况应以代码、测试和发布说明为准。
+路线图按“先保证运行时控制，再建设治理平台”的顺序推进。已完成项仅覆盖描述的范围，不代表生产就绪或整个阶段完成；详细状态和门禁以 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) 为准。
 
 ### 运行时守卫（开源优先）
 
-- [ ] Token 预估、预留、精确结算和 Run 级硬预算
-- [ ] 单次请求 `max_output_tokens` 注入与流式停止
-- [ ] 成本计算、模型价格表和成本上限
-- [ ] RPM、TPM、并发数、工具次数和租户级限流
-- [ ] LLM、工具、RAG、缓存和 Agent Run 的统一耗时记录
-- [ ] 超时、熔断、模型降级和结构化异常
+- [x] Token 预估、预留、供应商 usage/估算结算和 Run 级硬预算（费用账单仍为估算）
+- [x] 单次请求 `max_output_tokens` 注入与流式预算停止
+- [x] 成本计算、版本化模型价格表和请求/Run 成本上限
+- [x] RPM、TPM、并发数和工具调用限制（本地或 Redis 限流；租户级长期配额未实现）
+- [x] 模型、工具、Run 耗时事件（RAG/缓存专用集成尚未实现）
+- [x] 异步协作超时、同步检查点、熔断、能力约束模型降级、工具幂等/审批门禁和可选模型重试
 - [ ] JSON Schema、规则评分器和可插拔质量评估器
 - [ ] Agent 循环检测、最大步数和无进展检测
 
 ### Developer Experience（开源优先）
 
-- [ ] OpenAI 兼容 Wrapper、装饰器和上下文管理器
+- [x] 通用客户端 Wrapper、装饰器和 Run 上下文管理器（不表示已通过所有供应商兼容测试）
 - [ ] LangChain、LlamaIndex、CrewAI、AutoGen 和 MCP 适配器
-- [ ] 内存、Redis 和 SQLite 后端
+- [x] 内存 admission/预算、Redis admission、SQLite Run/本地策略存储（完整跨进程预算账本未实现）
 - [ ] Prometheus / OpenTelemetry 导出
 - [ ] `agentguard init`、策略校验和本地模拟器
-- [ ] 完整单元测试、集成测试和供应商兼容性测试
+- [ ] 单元/集成/浏览器端到端测试；真实供应商兼容矩阵和发布 CI 尚未实现
+
+### 本地控制台（当前可运行）
+
+- [x] Vue 3 运行概览、运行列表/调用树、策略编辑和接入设置
+- [x] FastAPI + SQLite 事件查询和原子策略版本；仅本机使用，远程身份授权未实现
+- [x] `npm.cmd --prefix frontend run test:e2e` 执行真实 HTTP 浏览器验证
 
 ### Control Plane（商业版或独立部署）
 
