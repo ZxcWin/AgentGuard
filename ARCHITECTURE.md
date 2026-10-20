@@ -1,10 +1,12 @@
 # AgentGuard 架构说明
 
-本文档定义 AgentGuard 开源 SDK 的目标架构、模块边界和演进约束。当前已建立分层目录并保留旧模块兼容导出，调用管线继续拆分。可选控制台通过 `api/http.py`、`ports/RunStore`/`PolicyStore` 与 SQLite 适配器连接 SDK，前端独立放在 `frontend/`。本地策略可在显式连接同一 SQLitePolicyStore 的进程间共享，新 Run 读取新版本；后台遥测、远程授权与跨机器治理仍待实现。
+本文档定义 AgentGuard 开源 SDK 的目标架构、模块边界和演进约束。当前已建立分层目录并保留旧模块兼容导出。可选控制台通过 `api/http.py`、存储 Port 与 SQLite 适配器连接 SDK，前端独立放在 `frontend/`。本地 SQLite 策略支持进程间共享；远程快照提供认证、完整性、作用域、版本及有效期验证。单工作空间角色权限位于 HTTP 边界，SDK 可独立注入共享预算、审计与远程策略；组织级商业治理保持独立。
+
+预算一致性、事件故障与保留、缓存禁止项、平台支持、远程策略失联/回滚以及成本账本的默认值已在 [工程决策基线](docs/DECISIONS.md) 定案。本文的目标架构与后续实现均须遵守该基线；其中未交付的能力不代表当前 SDK 已支持。
 
 ## 1. 设计目标
 
-- **低延迟**：请求前决策必须是本地、可预测的同步路径；网络上报不能阻塞业务调用。
+- **低延迟**：本地策略计算采用可预测的进程内路径；启用共享硬预算时允许有界的权威 Redis 准入往返。普通网络遥测不能阻塞业务，显式必需审计按可靠写入门禁处理。
 - **可组合**：预算、限流、安全、质量和缓存是独立策略，可单独启用、替换和测试。
 - **供应商无关**：核心层不能导入 OpenAI、Anthropic、LangChain、Redis 或向量数据库 SDK。
 - **可恢复**：异常、取消、超时、流式中断和进程退出都必须释放预留、并发槽位和临时状态。
@@ -92,6 +94,10 @@ tests/
 
 允许依赖方向为 `api/cli → application → domain/ports`，以及 `adapters → ports/domain`。禁止 domain 导入 application、适配器或配置加载器；禁止 provider adapter 直接访问具体 storage；禁止 telemetry 反向改变策略结果。违反规则应在 CI 中通过 import-linter 或等价检查阻断。
 
+普通事件通过 ports.EventSink 注入，版本信封和元数据白名单位于 domain/events.py；后台线程、有界队列、文件轮转与指标序列化在 adapters。当前 runtime 作为组合入口装配这些适配器，application/telemetry.py 仅保留导入出口。Schema 校验器位于 adapters/validation，按需加载 jsonschema；离线 CLI 复用同一运行时，不复制治理规则。普通遥测与可靠审计的实现边界见 docs/TELEMETRY.md。
+
+必需审计通过 AuditCoordinator 与 AuditStore 注入，在执行前后写入 SQLiteAuditStore，归档目标 SQLiteAuditArchive 按事件 ID 幂等；普通遥测不能代替该路径。SharedBudgetManager 将本地预留与 RedisBudgetStore 原子额度组合，未知提交保留占用。RemoteConfigManager 验证签名快照并提供每 Run 的有效期检查。SQLiteCostLedger 单独保存不可变估算、供应商账单与调整，避免观测存储冒充最终账单。详细恢复及持久性边界见 docs/OPERATIONS.md。
+
 ## 5. 关键不变量
 
 1. 一次 reservation 只能 settle 或 release 一次，且二者都必须幂等。
@@ -99,7 +105,7 @@ tests/
 3. 请求前拒绝不能调用供应商；缓存命中不能增加 LLM 调用和供应商成本。
 4. 重试必须有上限、独立预算和可识别的父子调用关系。
 5. 真实 usage 缺失时必须标注估算来源，不能把估算伪装成供应商 usage。
-6. 事件发布失败默认不改变业务结果，但同步审计模式必须显式配置并有背压策略。
+6. 普通事件发布失败默认不改变业务结果；必需审计须在受保护操作前可靠写入，且有背压和超时。已发生副作用不能因审计失败被伪装为未执行，默认保留与故障语义见 D03。
 7. `ContextVar` 只传递上下文句柄，不保存跨线程共享的可变策略状态。
 
 ## 6. 版本与兼容性

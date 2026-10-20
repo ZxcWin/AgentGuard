@@ -4,6 +4,9 @@ from .merge import deep_merge
 from .manager import ConfigManager, ConfigSnapshot
 from .schema import (
     AgentGuardConfig,
+    CacheConfig,
+    CircuitConfig,
+    EnforcementConfig,
     BudgetConfig,
     DegradationConfig,
     ModelPriceConfig,
@@ -15,10 +18,15 @@ from .schema import (
     TokenConfig,
     TimeoutConfig,
     ToolConfig,
+    SecurityConfig,
+    QualityConfig,
 )
 
 __all__ = [
     "AgentGuardConfig",
+    "CacheConfig",
+    "CircuitConfig",
+    "EnforcementConfig",
     "BudgetConfig",
     "DegradationConfig",
     "ModelPriceConfig",
@@ -30,6 +38,8 @@ __all__ = [
     "TokenConfig",
     "TimeoutConfig",
     "ToolConfig",
+    "SecurityConfig",
+    "QualityConfig",
     "ConfigManager",
     "ConfigSnapshot",
     "deep_merge",

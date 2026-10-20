@@ -8,6 +8,8 @@ from time import monotonic
 from typing import Any, TYPE_CHECKING
 
 from ..domain.exceptions import BudgetExceeded, ExecutionTimeout
+from ..policies.content import ContentLimit, text_content
+from .guards import check_quality, check_security, content_limit
 from ..domain.models import CallContext, Usage
 from .deadlines import current_deadline, inherited_deadline
 
@@ -29,6 +31,12 @@ class CallLifecycle:
         self.output_tokens = 0
         self.provider_usage: Usage | None = None
         self.stream_started = False
+        self.quality_error = None
+        self.quality_response = None
+        self.audit_operation = None
+        self._stream_text = ""
+        self._security_raw_text = ""
+        self._content_overflow = False
         from .retries import current_attempt
         attempt = current_attempt.get()
         self.retry_attempt = attempt if attempt is not None and attempt.context is context and attempt.call is None else None
@@ -49,12 +57,13 @@ class CallLifecycle:
         self.context._active_calls.pop(self.metadata.request_id, None)
         from .runtime import _extract_usage, _resolve_usage
         usage = None
+        settled_cost = None
         try:
             # Interceptors may replace the returned value, but cannot replace
             # the provider's billable usage with their own fabricated value.
             original_usage = _extract_usage(response) if error is None and not stream else None
-            if error is None and not stream:
-                response = self.context.interceptors.after_response(response)
+            if error is None and not stream and self.admitted.cache_ticket is not None:
+                self.admitted.cache_ticket.capture(response)
             if error is None or (stream and self.stream_started) or (
                 self.retry_attempt is not None and self.retry_attempt.provider_error is error
             ):
@@ -63,32 +72,86 @@ class CallLifecycle:
                 if error is not None and not stream:
                     self.context.state.record("budget.failed_attempt_estimated", request_id=self.metadata.request_id,
                                               total_tokens=actual.total_tokens, usage_source="estimate")
-                usage = _resolve_usage(self.context, self.admitted.estimated_usage, actual, self.admitted.model)
+                try:
+                    usage = _resolve_usage(self.context, self.admitted.estimated_usage, actual, self.admitted.model)
+                except BudgetExceeded:
+                    # A post-call usage policy failure cannot refund incurred work.
+                    usage = self.admitted.estimated_usage if actual.source == "unknown" else actual
+                    cost = self.context.pricing.estimate(self.admitted.model, usage)
+                    settled_cost = self.admitted.estimated_cost if cost is None else cost
+                    self.admitted.reservation.settle(usage, self.admitted.estimated_cost if cost is None else cost)
+                    raise
                 cost = self.context.pricing.estimate(self.admitted.model, usage)
+                settled_cost = self.admitted.estimated_cost if cost is None else cost
                 self.admitted.reservation.settle(usage, self.admitted.estimated_cost if cost is None else cost)
+            # A rejected response has already incurred provider charges. Settle
+            # first so gates/callback failures cannot erase billable usage.
+            if error is None and not stream:
+                if self.context.security_guard is not None:
+                    response = check_security(self.context, self.metadata, response, stage="response")
+                response = self.context.interceptors.after_response(response)
+                if self.context.security_guard is not None and self.context.interceptors.interceptors:
+                    response = check_security(self.context, self.metadata, response, stage="response")
+                if self.context.quality_guard is not None:
+                    try:
+                        check_quality(self.context, self.metadata, response)
+                    except BaseException as quality_error:
+                        self.quality_error = quality_error
+                        if self.retry_attempt is not None:
+                            self.quality_response = response
+                        raise
+            if error is None and stream and self.context.quality_guard is not None:
+                if self._content_overflow:
+                    content_limit(self.context, self.metadata, "quality", "stream")
+                else:
+                    check_quality(self.context, self.metadata, self._stream_text, stage="stream")
+            if error is None:
+                self.deadline.check()
         except BaseException as processing_error:
             if error is None:
                 error = processing_error
         finally:
+            self._stream_text = ""
+            self._security_raw_text = ""
             try:
                 self.admitted.admission.release()
             finally:
                 self.admitted.reservation.release()
         event = "llm.completed" if error is None else "llm.failed"
+        if self.audit_operation is not None:
+            try:
+                self.context.audit.end(self.audit_operation, outcome="completed" if error is None else "failed",
+                    run_id=self.context.state.run_id, request_id=self.metadata.request_id,
+                    execution_may_have_completed=True, total_tokens=usage.total_tokens if usage else None,
+                    estimated_cost_usd=float(settled_cost) if settled_cost is not None else None)
+            except Exception as audit_error:
+                error = audit_error
+                self.quality_error = None
+                self.quality_response = None
+                event = "llm.failed"
+        if error is None and not stream:
+            self.context.behavior.output(response)
         fields = dict(request_id=self.metadata.request_id, parent_id=self.metadata.parent_id,
                       duration_seconds=monotonic() - self.started,
                       outcome="completed" if error is None else "timed_out" if isinstance(error, ExecutionTimeout)
                       else "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed")
         if usage is not None:
             fields.update(total_tokens=usage.total_tokens, usage_source=usage.source)
+        if settled_cost is not None:
+            fields["estimated_cost_usd"] = float(settled_cost)
         if isinstance(error, ExecutionTimeout):
             fields["reason_code"] = error.reason_code
             self.context.state.record("llm.timed_out", **fields)
+        if error is not None and hasattr(error, "reason_code"):
+            fields["reason_code"] = error.reason_code
         self.context.state.record(event, **fields)
         if error is None:
             self.context.circuits.record_success(self.admitted.circuit_key)
         elif not isinstance(error, (asyncio.CancelledError, GeneratorExit, ExecutionTimeout)):
             self.context.circuits.record_failure(self.admitted.circuit_key, error)
+        if error is not None and (isinstance(error, (asyncio.CancelledError, GeneratorExit, ExecutionTimeout))
+                                  or not self.context.circuits.is_provider_failure(error)):
+            self.context.circuits.abandon_probe(self.admitted.circuit_key)
         try:
             if error is not None:
                 try:
@@ -98,10 +161,16 @@ class CallLifecycle:
         finally:
             try:
                 self.context.interceptors.on_finish(self.metadata)
-            except BaseException:
+            except BaseException as finish_error:
                 if error is None:
+                    error = finish_error
                     raise
             finally:
+                if self.admitted.cache_ticket is not None:
+                    if error is None and not stream:
+                        self.admitted.cache_ticket.publish()
+                    else:
+                        self.admitted.cache_ticket.release()
                 if self.context._automatic and not self.context._active_calls and not self.context._retry_sessions:
                     self.context._complete(error)
         if error is not None:
@@ -118,6 +187,13 @@ class CallLifecycle:
     def chunk(self, chunk: Any) -> Any:
         from .runtime import _extract_usage, _stream_token_count
         self.stream_started = True
+        if self.context.security_guard is not None and self.context.security_guard.action == "redact":
+            from ..domain.exceptions import SecurityViolation
+            from .guards import security_audit
+            security_audit(self.context, self.metadata, outcome="blocked", stage="stream", reason="redaction_stream_unsupported")
+            self.context.state.record("security.rejected", request_id=self.metadata.request_id, stage="stream",
+                                      action="block", reason_code="redaction_stream_unsupported")
+            raise SecurityViolation(stage="stream", finding_count=0)
         usage = _extract_usage(chunk)
         if usage.source != "unknown":
             self.provider_usage = usage
@@ -134,7 +210,38 @@ class CallLifecycle:
             self._first_token = True
             self.context.state.record("llm.first_token", request_id=self.metadata.request_id,
                                       duration_seconds=monotonic() - self.started)
-        return self.context.interceptors.on_chunk(chunk, self.metadata)
+        if self.context.security_guard is not None:
+            limit = self.context.security_guard.max_chars
+            check_security(self.context, self.metadata, chunk, stage="stream")
+            try:
+                text = text_content(chunk, limit)
+                if len(self._security_raw_text) + len(text) > limit:
+                    raise ContentLimit()
+                self._security_raw_text += text
+            except ContentLimit:
+                self._security_raw_text = ""
+                content_limit(self.context, self.metadata, "security", "stream")
+            check_security(self.context, self.metadata, self._security_raw_text, stage="stream")
+        chunk = self.context.interceptors.on_chunk(chunk, self.metadata)
+        if self.context.security_guard is not None and self.context.interceptors.interceptors:
+            check_security(self.context, self.metadata, chunk, stage="stream")
+        guards = [guard for guard in (self.context.security_guard, self.context.quality_guard) if guard is not None]
+        if guards:
+            limit = max(guard.max_chars for guard in guards)
+            try:
+                text = text_content(chunk, limit)
+                if len(self._stream_text) + len(text) > limit:
+                    raise ContentLimit()
+                self._stream_text += text
+            except ContentLimit:
+                self._content_overflow = True
+                self._stream_text = ""
+                if self.context.security_guard is not None:
+                    content_limit(self.context, self.metadata, "security", "stream")
+            if self.context.security_guard is not None:
+                # Scan cumulative text so findings split across chunks are seen.
+                check_security(self.context, self.metadata, self._stream_text, stage="stream")
+        return chunk
 
 
 class SyncStream:
@@ -295,6 +402,8 @@ class PendingResponse(Coroutine):
         run_token = _current_run.set(self.call.context)
         try:
             self.call.deadline.check()
+            if self.call.context.policy_valid is not None:
+                self.call.context.policy_valid()
             try:
                 response = await self.call.deadline.wait(self.target)
             except BaseException as error:

@@ -1,0 +1,1 @@
+"""Optional validation adapters."""

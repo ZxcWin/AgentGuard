@@ -62,14 +62,14 @@ class PricingTable:
             return None
         input_tokens = max(0, usage.input_tokens - usage.cached_tokens)
         cached_tokens = min(usage.input_tokens, usage.cached_tokens)
-        output_rate = price.reasoning_output_per_million or price.output_per_million
+        output_rate = price.reasoning_output_per_million
         cached_rate = price.cached_input_per_million
         total = Decimal(input_tokens) * price.input_per_million / Decimal(1_000_000)
         total += Decimal(usage.output_tokens) * price.output_per_million / Decimal(1_000_000)
         if usage.reasoning_tokens and price.reasoning_output_per_million is not None:
             total += Decimal(usage.reasoning_tokens) * (output_rate - price.output_per_million) / Decimal(1_000_000)
-        if cached_tokens and cached_rate is not None:
-            total += Decimal(cached_tokens) * cached_rate / Decimal(1_000_000)
+        if cached_tokens:
+            total += Decimal(cached_tokens) * (price.input_per_million if cached_rate is None else cached_rate) / Decimal(1_000_000)
         return total.quantize(_MICRO_USD, rounding=ROUND_HALF_UP)
 
     @classmethod

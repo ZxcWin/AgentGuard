@@ -206,7 +206,9 @@ def test_async_cancellation_during_backoff_cleans_up():
     asyncio.run(execute())
 
 
-def test_retry_elapsed_budget_keeps_original_error_when_delay_does_not_fit():
+def test_retry_elapsed_budget_keeps_original_error_when_delay_does_not_fit(monkeypatch):
+    # This verifies that a retry delay cannot fit, rather than machine speed.
+    monkeypatch.setattr("agentguard.application.deadlines.monotonic", lambda: 100.0)
     error = UpstreamError()
     with guard(max_elapsed_seconds=.001, initial_delay_seconds=1, jitter=False).run() as run:
         with pytest.raises(UpstreamError) as caught: run.invoke(lambda: (_ for _ in ()).throw(error))

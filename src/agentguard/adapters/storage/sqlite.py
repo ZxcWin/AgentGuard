@@ -9,14 +9,10 @@ from threading import RLock
 from typing import Any
 
 from ...domain.models import RunState
+from ...domain.events import EVENT_FIELDS, operational_event
 
 
 # Only operational metadata crosses the storage boundary. Payloads are excluded.
-EVENT_FIELDS = {"event", "timestamp", "config_version", "request_id", "trace_id", "run_id",
-                "parent_id", "attempt", "estimated_tokens", "actual_tokens", "total_tokens",
-                "limit", "reason_code", "action", "duration_seconds", "model", "usage_source", "outcome",
-                "tool", "side_effect", "result_type", "result_size", "execution_may_have_completed", "delay_seconds",
-                "from_model", "to_model", "trigger_reason", "idempotency_key_hash", "approval_required", "approval_outcome"}
 
 
 class SQLiteRunStore:
@@ -35,9 +31,7 @@ class SQLiteRunStore:
             self._db.close()
 
     def save(self, state: RunState, config_version: int) -> None:
-        events = [{key: value for key, value in item.items()
-                   if key in EVENT_FIELDS and isinstance(value, (str, int, float, bool, type(None)))}
-                  for item in state.events]
+        events = [operational_event(item) for item in state.events]
         for index, event in enumerate(events):
             event["id"] = f"{state.run_id}:{index}"
         summary = state.summary()
@@ -61,6 +55,28 @@ class SQLiteRunStore:
         with self._lock:
             row = self._db.execute("SELECT summary, events FROM runs WHERE run_id=?", (run_id,)).fetchone()
         return {**json.loads(row[0]), "events": json.loads(row[1])} if row else None
+
+    def cost_estimates(self, *, limit: int = 1000) -> list[dict[str, str]]:
+        """Bounded durable terminal-call estimates, distinct from supplier invoices."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Invalid estimate sync bound")
+        with self._lock:
+            rows = self._db.execute("SELECT events FROM runs WHERE status!='running' ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        return [{"request_id": event["request_id"],
+                 "amount_usd": format(Decimal(str(event["estimated_cost_usd"])).quantize(Decimal("0.000000001")), "f")}
+                for row in rows for event in json.loads(row[0])
+                if event.get("event") in {"llm.completed", "llm.failed"} and event.get("request_id")
+                and event.get("estimated_cost_usd") is not None]
+
+    def prune(self, retention_days: int = 7, *, now: datetime | None = None) -> int:
+        """Delete ordinary terminal run telemetry by completion time; keep active runs."""
+        if type(retention_days) is not int or not 1 <= retention_days <= 30:
+            raise ValueError("retention_days must be between 1 and 30")
+        cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._db:
+            result = self._db.execute("DELETE FROM runs WHERE status IN ('completed','failed','cancelled','timed_out') "
+                                      "AND json_extract(summary, '$.ended_at') < ?", (cutoff,))
+            return result.rowcount
 
     def list(self, *, hours: int = 24, status: str = "", search: str = "", page: int = 1,
              page_size: int = 12) -> dict[str, Any]:

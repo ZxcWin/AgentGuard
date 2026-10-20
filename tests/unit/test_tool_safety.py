@@ -131,11 +131,16 @@ def test_async_approval_failure_cleans_up_and_key_can_be_used_after_approval(out
         async def write():
             effects.append(1)
             return "ok"
-        guard = AgentGuard({"tools": {"approval_required_for": ["write"], "approval_timeout_seconds": 0.01},
+        guard = AgentGuard({"tools": {"approval_required_for": ["write"], "approval_timeout_seconds": 0.1},
                             "rate_limit": {"max_concurrency": 1}})
         async with guard.run() as run:
             task = asyncio.create_task(run.invoke_tool("write", write, approval=approval, idempotency_key="key"))
-            await entered.wait()
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
             if outcome == "cancelled":
                 task.cancel()
             expected = {"denied": ToolApprovalDenied, "timed_out": ExecutionTimeout,

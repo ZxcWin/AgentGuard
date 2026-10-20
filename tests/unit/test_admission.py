@@ -91,3 +91,27 @@ def test_admission_rejects_new_key_when_all_keys_are_active():
     with pytest.raises(RateLimitExceeded, match="cardinality"):
         controller.acquire(key="second")
     lease.release()
+
+
+def test_cardinality_churn_cannot_erase_live_rate_windows(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("agentguard.policies.rate_limit.monotonic",lambda:clock[0])
+    config = AgentGuardConfig.from_mapping({"rate_limit":{"max_scope_keys":1,"rpm":1}})
+    controller = AdmissionController(config.rate_limit)
+    controller.acquire(key="first").release()
+    with pytest.raises(RateLimitExceeded): controller.acquire(key="second")
+    with pytest.raises(RateLimitExceeded): controller.acquire(key="first")
+    clock[0] += 61
+    controller.acquire(key="second").release()
+
+
+def test_rejected_budget_does_not_strand_half_open_probe():
+    from agentguard import BudgetExceeded
+    guard = AgentGuard({"token":{"run_token_budget":0}})
+    with guard.run() as run:
+        key = run.circuit_key(model=None)
+        breaker = run.circuits.get(key)
+        breaker.recovery_seconds = 0
+        breaker.opened_at = 0
+        with pytest.raises(BudgetExceeded): run.invoke(lambda:None)
+        assert not breaker.probe_in_flight

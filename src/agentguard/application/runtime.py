@@ -24,7 +24,7 @@ from ..adapters.storage.redis import RedisAdmissionController
 from .interceptors import BaseInterceptor, InterceptorChain
 from ..domain.exceptions import BudgetExceeded, RateLimitExceeded
 from ..domain.models import CallContext, RequestSnapshot, RunState, Usage
-from ..ports import RunStore
+from ..ports import RunStore, ExactCacheStore, EventSink, AuditStore
 import logging
 import asyncio
 from uuid import uuid4
@@ -32,6 +32,10 @@ from inspect import iscoroutinefunction
 from .deadlines import Deadline, current_deadline, inherited_deadline
 from .lifecycle import CallLifecycle, current_call, dispatch
 from ..domain.exceptions import AgentGuardError, ExecutionTimeout
+from ..policies.security import SecurityGuard
+from ..policies.quality import QualityGuard
+from ..domain.cache import CacheRequest, ToolCacheRequest
+from ..domain.quality import QualityRecovery
 
 
 _current_run: ContextVar["RunContext | None"] = ContextVar("agentguard_run", default=None)
@@ -48,10 +52,30 @@ class RunContext(AbstractContextManager["RunContext"]):
     state: RunState
     config_version: int = 1
     run_store: RunStore | None = None
+    security_guard: SecurityGuard | None = None
+    quality_guard: QualityGuard | None = None
+    cache_runtime: Any = None
+    audit: Any = None
+    policy_valid: Any = None
+    shared_budget_store: Any = None
+    quality_recovery: QualityRecovery | None = None
 
     def __post_init__(self) -> None:
+        from dataclasses import asdict
+        from .behavior import BehaviorMonitor
+        self.behavior = BehaviorMonitor(self.config.behavior)
+        if self.cache_runtime is None:
+            from .caching import CacheRuntime
+            self.cache_runtime = CacheRuntime()
+        if self.security_guard is None and self.config.security.enabled:
+            self.security_guard = SecurityGuard(**{key: value for key, value in asdict(self.config.security).items() if key != "enabled"})
+        if self.quality_guard is None and self.config.quality.enabled:
+            self.quality_guard = QualityGuard(**{key: value for key, value in asdict(self.config.quality).items() if key != "enabled"})
         self.pricing = PricingTable.from_config(self.config.pricing)
         self.budget = BudgetManager(self.config, self.state, self.pricing)
+        if self.shared_budget_store is not None:
+            from .shared_budget import SharedBudgetManager
+            self.budget = SharedBudgetManager(self.budget, self.shared_budget_store)
         self.admission = AdmissionController(self.config.rate_limit)
         if self.config.rate_limit.backend == "redis":
             try:
@@ -62,7 +86,7 @@ class RunContext(AbstractContextManager["RunContext"]):
                 raise RuntimeError("Redis 后端需要安装 Redis 客户端") from error
             client = redis_module.Redis.from_url(self.config.rate_limit.redis_url)
             self.admission = RedisAdmissionController(client, self.config.rate_limit)
-        self.circuits = CircuitRegistry()
+        self.circuits = CircuitRegistry(**asdict(self.config.circuit))
         self.interceptors = InterceptorChain()
         self._token = None
         self._pending: dict[str, Any] = {}
@@ -146,9 +170,22 @@ class RunContext(AbstractContextManager["RunContext"]):
             self._token = None
 
     def _check(self) -> None:
+        from .quality_recovery import recovering_run
+        if recovering_run.get() is self:
+            raise RuntimeError("Quality handlers must only build requests or obtain approval")
         if self._closed or self._closing:
             raise RuntimeError("Cannot invoke a closed Run")
         self.deadline.check()
+        if self.audit is not None:
+            self.audit.check()
+        self.behavior.check()
+        if self.policy_valid is not None:
+            self.policy_valid()
+
+    def mark_progress(self, marker: str) -> None:
+        """Application reports a verified milestone; repeating a marker cannot reset limits."""
+        self.behavior.progress(marker)
+        self.state.record("behavior.progress")
 
     def _defer(self, factory: Callable[..., Any], *, target: Any = None) -> Any:
         from .tool_calls import ToolPending
@@ -182,9 +219,10 @@ class RunContext(AbstractContextManager["RunContext"]):
         function: Callable[..., T],
         *args: Any,
         budget_purpose: str = "primary",
+        cache_options: CacheRequest | None = None,
         **kwargs: Any,
     ) -> T:
-        return _invoke_guarded(self, function, *args, budget_purpose=budget_purpose, **kwargs)
+        return _invoke_guarded(self, function, *args, budget_purpose=budget_purpose, cache_options=cache_options, **kwargs)
 
     def add_interceptor(self, interceptor: BaseInterceptor) -> None:
         """向当前 Run 添加一个拦截器。"""
@@ -197,10 +235,11 @@ class RunContext(AbstractContextManager["RunContext"]):
 
     def invoke_tool(self, tool_name: str, function: Callable[..., T], *args: Any,
                     idempotency_key: str | None = None, approval: Callable[..., Any] | None = None,
+                      cache_options: ToolCacheRequest | None = None,
                     **kwargs: Any) -> T:
         from .tool_calls import invoke_tool
         return invoke_tool(self, tool_name, function, args, kwargs,
-                           idempotency_key=idempotency_key, approval=approval)
+                           idempotency_key=idempotency_key, approval=approval, cache_options=cache_options)
 
     def scope_key(self, *, model: str | None = None, tool: str | None = None) -> tuple[str, ...]:
         values = {
@@ -214,6 +253,15 @@ class RunContext(AbstractContextManager["RunContext"]):
         }
         fields = tuple(dict.fromkeys(self.config.rate_limit.key_fields + self.config.budget.key_fields))
         return tuple(f"{field}={values[field] or '*'}" for field in fields)
+
+    def circuit_key(self, *, model: str | None = None, tool: str | None = None) -> str:
+        # Circuit identity always includes the operation kind and target, even
+        # when admission quotas intentionally aggregate multiple models/tools.
+        import json
+        return json.dumps(["tool" if tool is not None else "llm",
+                           tool if tool is not None else model,
+                           self.scope_key(model=model, tool=tool)],
+                          ensure_ascii=True, separators=(",", ":"))
 
 
 def _read_value(value: Any, key: str, default: Any = None) -> Any:
@@ -229,11 +277,17 @@ def _extract_usage(response: Any) -> Usage:
         for key in ("prompt_tokens", "input_tokens", "completion_tokens", "output_tokens")
     )
     try:
+        def count(value):
+            if type(value) is not int or not 0 <= value <= 10**12:
+                raise ValueError("Invalid provider token count")
+            return value
+        input_details = _read_value(usage, "prompt_tokens_details", None) or _read_value(usage, "input_tokens_details", {}) or {}
+        output_details = _read_value(usage, "completion_tokens_details", None) or _read_value(usage, "output_tokens_details", {}) or {}
         return Usage(
-            input_tokens=int(_read_value(usage, "prompt_tokens", _read_value(usage, "input_tokens", 0)) or 0),
-            output_tokens=int(_read_value(usage, "completion_tokens", _read_value(usage, "output_tokens", 0)) or 0),
-            cached_tokens=int(_read_value(usage, "cached_tokens", 0) or 0),
-            reasoning_tokens=int(_read_value(usage, "reasoning_tokens", 0) or 0),
+            input_tokens=count(_read_value(usage, "prompt_tokens", _read_value(usage, "input_tokens", 0))),
+            output_tokens=count(_read_value(usage, "completion_tokens", _read_value(usage, "output_tokens", 0))),
+            cached_tokens=count(_read_value(usage, "cached_tokens", _read_value(input_details, "cached_tokens", 0))),
+            reasoning_tokens=count(_read_value(usage, "reasoning_tokens", _read_value(output_details, "reasoning_tokens", 0))),
             source="provider" if has_usage else "unknown",
         )
     except (TypeError, ValueError, OverflowError):
@@ -269,9 +323,12 @@ def _resolve_usage(context: RunContext, estimated: Usage, actual: Usage, model: 
 def _request_estimates(
     context: RunContext, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[int, int]:
-    messages = kwargs.get("messages", args[0] if args else None)
+    messages = kwargs.get("messages", kwargs.get("input", kwargs.get("prompt", args[0] if args else None)))
     input_tokens = estimate_tokens(messages)
-    output_tokens = kwargs.get("max_output_tokens", kwargs.get("max_tokens"))
+    for parameter in ("system", "instructions", "tools", "functions", "response_format"):
+        if parameter in kwargs:
+            input_tokens += estimate_tokens(kwargs[parameter])
+    output_tokens = kwargs.get("max_output_tokens", kwargs.get("max_completion_tokens", kwargs.get("max_tokens")))
     if output_tokens is None:
         output_tokens = context.config.token.max_output_tokens or 256
     if not isinstance(output_tokens, int) or output_tokens < 0:
@@ -284,22 +341,34 @@ def _prepare_request(context: RunContext, function: Callable[..., T], kwargs: di
     if configured_limit is None:
         return kwargs
     prepared = dict(kwargs)
-    for parameter in ("max_output_tokens", "max_tokens"):
+    strict = context.config.enforcement.profile == "production"
+    if strict and sum(key in prepared for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")) > 1:
+        raise BudgetExceeded("Specify only one output token limit", reason_code="output_limit_ambiguous")
+    supplied = False
+    for parameter in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
         if parameter in prepared:
+            supplied = True
             value = prepared[parameter]
+            if strict and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+                raise BudgetExceeded("Output token limit must be a positive integer", reason_code="output_limit_invalid")
             if isinstance(value, int) and not isinstance(value, bool) and value > configured_limit:
                 prepared[parameter] = configured_limit
-            return prepared
+    if supplied:
+        return prepared
     try:
         parameters = signature(function).parameters
     except (TypeError, ValueError):
         parameters = {}
-    if "max_output_tokens" in parameters or any(
-        parameter.kind == parameter.VAR_KEYWORD for parameter in parameters.values()
-    ):
+    if "max_output_tokens" in parameters:
         prepared["max_output_tokens"] = configured_limit
+    elif "max_completion_tokens" in parameters:
+        prepared["max_completion_tokens"] = configured_limit
     elif "max_tokens" in parameters:
         prepared["max_tokens"] = configured_limit
+    elif any(parameter.kind == parameter.VAR_KEYWORD for parameter in parameters.values()):
+        prepared["max_output_tokens"] = configured_limit
+    elif strict:
+        raise BudgetExceeded("Provider entry cannot accept an output limit", reason_code="output_limit_unsupported")
     return prepared
 
 
@@ -347,6 +416,7 @@ class _AdmittedCall:
     admission: Any
     reservation: Any
     circuit_key: str
+    cache_ticket: Any = None
 
 
 def _apply_interceptors(
@@ -389,14 +459,40 @@ def _prepare_call(
         context, call_context, args, prepared_kwargs
     )
     prepared_kwargs = _prepare_request(context, function, prepared_kwargs)
+    if context.security_guard is not None:
+        from .guards import check_security
+        prepared_args, prepared_kwargs = check_security(context, call_context, (prepared_args, prepared_kwargs), stage="request")
+        if context.security_guard.action == "redact" and prepared_kwargs.get("stream") is True:
+            from ..domain.exceptions import SecurityViolation
+            if context.audit is not None:
+                context.audit.decision(action="security.check", outcome="blocked", stage="request",
+                    reason_code="redaction_stream_unsupported", run_id=context.state.run_id, request_id=call_context.request_id)
+            context.state.record("security.rejected", request_id=call_context.request_id, stage="request",
+                                 action="block", reason_code="redaction_stream_unsupported")
+            raise SecurityViolation(stage="request", finding_count=0)
     input_tokens, output_tokens = _request_estimates(context, prepared_args, prepared_kwargs)
     model = prepared_kwargs.get("model")
+    if context.pricing.price_for(model) is None and context.config.token.missing_price == "reject":
+        if context.audit is not None:
+            context.audit.decision(action="budget.reject", outcome="rejected", reason_code="price_missing",
+                                   run_id=context.state.run_id, request_id=call_context.request_id)
+        context.state.record("budget.price_missing", model=model, action="reject")
+        context.state.record("budget.rejected", reason_code="price_missing", action="reject")
+        raise BudgetExceeded("未配置该模型的价格", reason_code="price_missing")
     estimated_usage = Usage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         source="estimate",
     )
     estimated_cost = context.pricing.estimate(model, estimated_usage) or 0.0
+    from .retries import current_attempt
+    attempt = current_attempt.get()
+    if attempt is not None and attempt.context is context and attempt.call is None and attempt.fallback_active:
+        rejection = fallback_rejection(context.config.degradation, prepared_args, prepared_kwargs,
+                                       context.pricing.estimate(model, estimated_usage))
+        if model != context.config.degradation.fallback_model or rejection is not None:
+            from ..domain.exceptions import QualityViolation
+            raise QualityViolation(action="block")
     if prepared_kwargs.get("stream") is True and context.config.token.run_token_budget is not None:
         remaining_budget = (
             context.config.token.run_token_budget
@@ -412,7 +508,7 @@ def _prepare_call(
                 output_tokens=output_tokens,
                 source="estimate",
             )
-            for parameter in ("max_output_tokens", "max_tokens"):
+            for parameter in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
                 if parameter in prepared_kwargs:
                     prepared_kwargs = dict(prepared_kwargs)
                     prepared_kwargs[parameter] = output_tokens
@@ -467,7 +563,7 @@ def _admit_call(
     except BaseException:
         admission.release()
         raise
-    circuit_key = key
+    circuit_key = context.circuit_key(model=model)
     try:
         context.circuits.before_call(circuit_key)
     except BaseException:
@@ -483,6 +579,10 @@ def _admit_call(
         )
     except BudgetExceeded as error:
         admission.release()
+        context.circuits.abandon_probe(circuit_key)
+        if context.audit is not None:
+            context.audit.decision(action="budget.reject", outcome="rejected", reason_code=error.reason_code,
+                                   run_id=context.state.run_id, request_id=prepared.call_context.request_id)
         fallback_model = context.config.degradation.fallback_model
         can_downgrade = (
             context.config.token.on_exceeded == "downgrade"
@@ -541,15 +641,20 @@ def _admit_call(
         )
         # The original lease was released before selecting a fallback. Admit the
         # fallback under its own model key; never call it with a released lease.
-        circuit_key = "|".join(context.scope_key(model=model))
+        fallback_key = "|".join(context.scope_key(model=model))
+        circuit_key = context.circuit_key(model=model)
         try:
-            admission = context.admission.acquire(estimated_usage.total_tokens, key=circuit_key,
+            admission = context.admission.acquire(estimated_usage.total_tokens, key=fallback_key,
                                                  wait=context._wait_budget(inherited_deadline(context.deadline)) if wait is None else wait)
             context.circuits.before_call(circuit_key)
         except BaseException:
             admission.release()
             reservation.release()
             raise
+    except BaseException:
+        admission.release()
+        context.circuits.abandon_probe(circuit_key)
+        raise
     return _AdmittedCall(
         args=args,
         kwargs=kwargs,
@@ -567,12 +672,15 @@ def _invoke_guarded(
     function: Callable[..., T],
     *args: Any,
     budget_purpose: str = "primary",
+    cache_options: CacheRequest | None = None,
     **kwargs: Any,
 ) -> T:
-    if context.config.retry.max_retries and kwargs.get("stream") is not True:
+    if (context.config.retry.max_retries or context.config.quality.max_retries) and kwargs.get("stream") is not True:
+        if cache_options is not None:
+            context.state.record("cache.bypassed", reason_code="retry_enabled")
         from .retries import invoke_with_retry
         return invoke_with_retry(context, function, args, kwargs, budget_purpose)
-    return _invoke_once(context, function, *args, budget_purpose=budget_purpose, **kwargs)
+    return _invoke_once(context, function, *args, budget_purpose=budget_purpose, cache_options=cache_options, **kwargs)
 
 
 def _invoke_once(
@@ -580,42 +688,74 @@ def _invoke_once(
     function: Callable[..., T],
     *args: Any,
     budget_purpose: str = "primary",
+    cache_options: CacheRequest | None = None,
     **kwargs: Any,
 ) -> T:
+    from .caching import MISS, prepare_cache, lookup, async_lookup
     if iscoroutinefunction(function):
         async def execute():
             context._check()
             request_deadline = inherited_deadline(context.deadline).child(context.config.timeout.llm_seconds, "llm")
             prepared = _prepare_call(context, function, args, kwargs)
-            wait_end = monotonic() + context.config.rate_limit.wait_timeout_seconds
-            while True:
-                request_deadline.check()
-                try:
-                    admitted = _admit_call(context, prepared, budget_purpose=budget_purpose, wait=0, record_rejection=False)
-                    break
-                except RateLimitExceeded:
-                    if monotonic() >= wait_end:
-                        context.state.record("rate_limit.rejected", reason_code="admission_timeout")
-                        raise
-                    remaining = request_deadline.remaining()
-                    await asyncio.sleep(min(.01, max(0, wait_end - monotonic()), remaining if remaining is not None else .01))
             token = current_deadline.set(request_deadline)
+            ticket = None
             try:
-                result = _execute_admitted(context, function, admitted, prepared.call_context)
-                return await result if isawaitable(result) else result
+                ticket = prepare_cache(context, prepared, cache_options)
+                cached = await async_lookup(ticket)
+                if cached is not MISS:
+                    return cached
+                return await _admit_and_execute_async(context, function, prepared, budget_purpose, request_deadline, ticket)
+            except BaseException:
+                if ticket is not None:
+                    ticket.release()
+                raise
             finally:
                 current_deadline.reset(token)
         return context._defer(execute)
     context._check()
     deadline = inherited_deadline(context.deadline).child(context.config.timeout.llm_seconds, "llm")
     token = current_deadline.set(deadline)
+    ticket = None
     try:
         prepared = _prepare_call(context, function, args, kwargs)
+        ticket = prepare_cache(context, prepared, cache_options)
+        cached = lookup(ticket)
+        if cached is not MISS:
+            return cached
         deadline.check()
         admitted = _admit_call(context, prepared, budget_purpose=budget_purpose)
+        if ticket is not None and ticket.token is not None and admitted.model == prepared.model:
+            admitted.cache_ticket = ticket
+        elif ticket is not None:
+            ticket.release()
         return _execute_admitted(context, function, admitted, prepared.call_context)
+    except BaseException:
+        if ticket is not None:
+            ticket.release()
+        raise
     finally:
         current_deadline.reset(token)
+
+
+async def _admit_and_execute_async(context, function, prepared, budget_purpose, request_deadline, ticket):
+    wait_end = monotonic() + context.config.rate_limit.wait_timeout_seconds
+    while True:
+        request_deadline.check()
+        try:
+            admitted = _admit_call(context, prepared, budget_purpose=budget_purpose, wait=0, record_rejection=False)
+            break
+        except RateLimitExceeded:
+            if monotonic() >= wait_end:
+                context.state.record("rate_limit.rejected", reason_code="admission_timeout")
+                raise
+            remaining = request_deadline.remaining()
+            await asyncio.sleep(min(.01, max(0, wait_end - monotonic()), remaining if remaining is not None else .01))
+    if ticket is not None and ticket.token is not None and admitted.model == prepared.model:
+        admitted.cache_ticket = ticket
+    elif ticket is not None:
+        ticket.release()
+    result = _execute_admitted(context, function, admitted, prepared.call_context)
+    return await result if isawaitable(result) else result
 
 
 def _execute_admitted(context: RunContext, function: Callable[..., T], admitted: _AdmittedCall, metadata: CallContext) -> T:
@@ -629,6 +769,13 @@ def _execute_admitted(context: RunContext, function: Callable[..., T], admitted:
     try:
         call.deadline.check()
         context.interceptors.on_start(call.metadata)
+        if context.policy_valid is not None:
+            context.policy_valid()
+        context.behavior.started()
+        if context.audit is not None:
+            call.audit_operation = context.audit.begin(action="llm.invoke", run_id=context.state.run_id,
+                trace_id=context.state.trace_id, request_id=call.metadata.request_id, model=admitted.model,
+                config_version=context.config_version, attempt=call.metadata.attempt)
         context.state.llm_calls += 1
         if call.retry_attempt is not None and call.metadata.attempt > 1:
             context.state.retry_count += 1
@@ -637,6 +784,10 @@ def _execute_admitted(context: RunContext, function: Callable[..., T], admitted:
                              run_id=call.metadata.run_id, parent_id=call.metadata.parent_id,
                              attempt=call.metadata.attempt, model=admitted.model)
         try:
+            if context.policy_valid is not None:
+                context.policy_valid()
+            if hasattr(admitted.reservation, "mark_started"):
+                admitted.reservation.mark_started()
             result = function(*admitted.args, **admitted.kwargs)
         except BaseException as error:
             if call.retry_attempt is not None:
@@ -767,11 +918,61 @@ class AgentGuard:
         config_path: str | None = None,
         config_manager: ConfigManager | None = None,
         run_store: RunStore | None = None,
+        security_guard: SecurityGuard | None = None,
+        quality_guard: QualityGuard | None = None,
+        cache_store: ExactCacheStore | None = None,
+        event_sink: EventSink | None = None,
+        event_queue_capacity: int = 1024,
+        audit_store: AuditStore | None = None,
+        audit_required: bool = False,
+        shared_budget_store: Any = None,
+        quality_recovery: QualityRecovery | None = None,
+        cache_signing_key: bytes | None = None,
+        event_sampling: Any = None,
+        event_batch_size: int = 64,
     ) -> None:
         if config_manager is not None and (config is not None or config_path is not None):
             raise ValueError("config_manager 与 config/config_path 不能同时传入")
         self._config_manager = config_manager or ConfigManager(config, config_path=config_path)
         self._run_store = run_store
+        self._shared_budget_store = shared_budget_store
+        self._security_guard = security_guard
+        self._quality_guard = quality_guard
+        if quality_recovery is not None and not isinstance(quality_recovery, QualityRecovery):
+            raise TypeError("quality_recovery must be QualityRecovery")
+        self._quality_recovery = quality_recovery
+        from .caching import CacheRuntime
+        self._cache_runtime = CacheRuntime(cache_store, signing_key=cache_signing_key)
+        from .audit import AuditCoordinator
+        from ..domain.exceptions import ConfigurationError
+        if audit_required and audit_store is None:
+            raise ConfigurationError("audit_required needs a durable audit_store")
+        self._audit = AuditCoordinator(audit_store) if audit_store is not None else None
+        from .telemetry import EventDispatcher
+        self._events = EventDispatcher(event_sink, capacity=event_queue_capacity, sampling=event_sampling,
+                                       batch_size=event_batch_size) if event_sink is not None else None
+
+    def recover_audit(self) -> None:
+        if self._audit is not None:
+            self._audit.recover()
+
+    def flush_events(self, timeout: float = 5.0) -> bool:
+        return self._events.flush(timeout) if self._events is not None else True
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """Drain telemetry within a finite timeout. Does not close caller-owned stores."""
+        return self._events.close(timeout) if self._events is not None else True
+
+    def telemetry_stats(self) -> dict[str, Any]:
+        return {"enabled": self._events is not None, **(self._events.stats() if self._events is not None else {})}
+
+    def telemetry_metrics(self) -> str:
+        """Prometheus exposition for this process; no user-controlled labels."""
+        return self._events.prometheus() if self._events is not None else ""
+
+    def clear_cache(self) -> None:
+        """Invalidate this Guard's local cache, including in-flight old keys."""
+        self._cache_runtime.clear()
 
     @property
     def config(self) -> AgentGuardConfig:
@@ -785,7 +986,13 @@ class AgentGuard:
         self._config_manager.reload()
 
     def update_config(self, values: dict[str, Any]) -> None:
-        self._config_manager.update(values)
+        operation = self._audit.begin(action="policy.update") if self._audit is not None else None
+        try:
+            self._config_manager.update(values)
+        except BaseException:
+            if operation is not None: self._audit.end(operation, outcome="failed", execution_may_have_completed=True)
+            raise
+        if operation is not None: self._audit.end(operation, outcome="completed")
 
     def run(
         self,
@@ -797,6 +1004,8 @@ class AgentGuard:
         environment: str | None = None,
         agent_id: str | None = None,
     ) -> RunContext:
+        if hasattr(self._config_manager, "validate_scope"):
+            self._config_manager.validate_scope(dict(tenant_id=tenant_id, project_id=project_id, environment=environment))
         snapshot = self._config_manager.snapshot()
         return RunContext(
             snapshot.config,
@@ -807,9 +1016,17 @@ class AgentGuard:
                 project_id=project_id,
                 environment=environment,
                 agent_id=agent_id,
+                event_observer=(lambda event: self._events.emit(event, tenant_id=tenant_id)) if self._events is not None else None,
             ),
             snapshot.version,
             self._run_store,
+            self._security_guard,
+            self._quality_guard,
+            self._cache_runtime,
+            self._audit,
+            getattr(snapshot, "valid", None),
+            self._shared_budget_store,
+            self._quality_recovery,
         )
 
     def wrap(self, client: Any) -> GuardedProxy:

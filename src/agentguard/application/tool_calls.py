@@ -11,6 +11,7 @@ from ..domain.models import CallContext
 from ..policies.tools import LoopDetected, ToolApprovalDenied
 from .lifecycle import current_call
 from .deadlines import current_deadline, inherited_deadline
+from .behavior import tool_stack
 
 
 def result_summary(value: Any) -> dict[str, Any]:
@@ -23,7 +24,7 @@ def result_summary(value: Any) -> dict[str, Any]:
 
 
 def invoke_tool(context: Any, name: str, function: Any, args: tuple, kwargs: dict,
-                *, idempotency_key: str | None = None, approval: Any = None) -> Any:
+                *, idempotency_key: str | None = None, approval: Any = None, cache_options: Any = None) -> Any:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("tool_name must be a nonempty string")
     # Async tool admission and side effects happen when awaited, never at creation.
@@ -46,11 +47,12 @@ def invoke_tool(context: Any, name: str, function: Any, args: tuple, kwargs: dic
                     await asyncio.sleep(min(.01, max(0, wait_end - monotonic()), remaining if remaining is not None else .01))
             try:
                 return await _invoke_async(context, name, function, args, kwargs, lease=lease, deadline=deadline,
-                                           idempotency_key=idempotency_key, approval=approval)
+                                           idempotency_key=idempotency_key, approval=approval, cache_options=cache_options)
             finally:
                 lease.release()
         return context._defer(execute)
-    return _invoke(context, name, function, args, kwargs, idempotency_key=idempotency_key, approval=approval)
+    return _invoke(context, name, function, args, kwargs, idempotency_key=idempotency_key, approval=approval,
+                   cache_options=cache_options)
 
 
 def _key_hash(key: str) -> str:
@@ -71,6 +73,9 @@ def _approval_call(approval: Any, name: str, key_hash: str | None) -> Any:
 
 
 def _reject(context: Any, name: str, reason: str, error: BaseException, *, key_hash: str | None = None) -> Any:
+    if context.audit is not None:
+        context.audit.decision(action="tool.reject", outcome="rejected", tool=name, reason_code=reason,
+                               run_id=context.state.run_id, idempotency_key_hash=key_hash)
     context.state.record("tool.rejected", tool=name, reason_code=reason, idempotency_key_hash=key_hash,
                          execution_may_have_completed=False)
     raise error
@@ -91,6 +96,8 @@ def _approval_failed(context: Any, name: str, key_hash: str | None, error: BaseE
                "denied" if isinstance(error, ToolApprovalDenied) else "failed")
     context.state.record("tool.approval_resolved", tool=name, idempotency_key_hash=key_hash,
                          approval_outcome=outcome, approval_required=True)
+    if context.audit is not None:
+        context.audit.decision(action="tool.approval", outcome=outcome, tool=name, idempotency_key_hash=key_hash)
     _reject(context, name, f"approval_{outcome}", error, key_hash=key_hash)
 
 
@@ -108,6 +115,8 @@ def _preflight(context: Any, name: str, effect: str, *, idempotency_key: str | N
                     LoopDetected("检测到重复幂等键，已在副作用前阻断"), key_hash=key_hash)
     approval_required = name in context.config.tools.approval_required_for
     if approval_required:
+        if context.audit is not None:
+            context.audit.decision(action="tool.approval", outcome="requested", tool=name, idempotency_key_hash=key_hash)
         context.state.record("tool.approval_requested", tool=name, idempotency_key_hash=key_hash, approval_required=True)
         try:
             if approval is None:
@@ -131,12 +140,14 @@ def _preflight(context: Any, name: str, effect: str, *, idempotency_key: str | N
             _approval_failed(context, name, key_hash, error)
         context.state.record("tool.approval_resolved", tool=name, idempotency_key_hash=key_hash,
                              approval_outcome="approved", approval_required=True)
+        if context.audit is not None:
+            context.audit.decision(action="tool.approval", outcome="approved", tool=name, idempotency_key_hash=key_hash)
     _remember_key(context, name, key_hash)
     return {"key_hash": key_hash, "approval_required": approval_required, "approval": None}
 
 
 async def _invoke_async(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *, lease: Any,
-                        deadline: Any, idempotency_key: str | None, approval: Any) -> Any:
+                        deadline: Any, idempotency_key: str | None, approval: Any, cache_options: Any) -> Any:
     effect = context.config.tools.side_effects.get(name, "write")
     preflight = _preflight(context, name, effect, idempotency_key=idempotency_key, approval=approval,
                            deadline=deadline, async_mode=True)
@@ -150,14 +161,17 @@ async def _invoke_async(context: Any, name: str, function: Any, args: tuple, kwa
             _approval_failed(context, name, preflight["key_hash"], error)
         context.state.record("tool.approval_resolved", tool=name, idempotency_key_hash=preflight["key_hash"],
                              approval_outcome="approved", approval_required=True)
+        if context.audit is not None:
+            context.audit.decision(action="tool.approval", outcome="approved", tool=name, idempotency_key_hash=preflight["key_hash"])
         _remember_key(context, name, preflight["key_hash"])
-    return await _invoke(context, name, function, args, kwargs, lease=lease, deadline=deadline,
-                         preflight=preflight)
+    result = _invoke(context, name, function, args, kwargs, lease=lease, deadline=deadline,
+                     preflight=preflight, cache_options=cache_options)
+    return await result if isawaitable(result) else result
 
 
 def _invoke(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *, lease: Any = None,
             deadline: Any = None, idempotency_key: str | None = None, approval: Any = None,
-            preflight: dict[str, Any] | None = None) -> Any:
+            preflight: dict[str, Any] | None = None, cache_options: Any = None) -> Any:
     context._check()
     deadline = deadline or inherited_deadline(context.deadline).child(context.config.timeout.tool_seconds, "tool")
     deadline.check()
@@ -177,23 +191,43 @@ def _invoke(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *
         deadline.check()
         context.state.record("rate_limit.rejected", reason_code="tool_admission_timeout", tool=name)
         raise
+    circuit_key = context.circuit_key(tool=name)
     try:
-        context.circuits.before_call(key)
+        context.circuits.before_call(circuit_key)
     except BaseException:
         admission.release()
         context.state.record("circuit.rejected", reason_code="circuit_open", tool=name)
+        raise
+    try:
+        context.behavior.acquire_tool(context.config.tools)
+    except LoopDetected:
+        admission.release()
+        context.circuits.abandon_probe(circuit_key)
+        context.state.record("tool.rejected", tool=name, reason_code="tool_behavior_limit")
         raise
     parent = current_call.get()
     metadata = CallContext(call_type="tool", run_id=context.state.run_id, trace_id=context.state.trace_id,
                            parent_id=parent.request_id if parent and parent.run_id == context.state.run_id else None)
     started = monotonic()
-    context.state.tool_calls += 1
     fields = {"tool": name, "request_id": metadata.request_id, "parent_id": metadata.parent_id,
               "run_id": metadata.run_id, "trace_id": metadata.trace_id, "side_effect": effect,
               "idempotency_key_hash": preflight["key_hash"],
               "approval_required": preflight["approval_required"],
               "approval_outcome": "approved" if preflight["approval_required"] else None}
+    audit_operation = None
+    try:
+        if context.audit is not None:
+            audit_operation = context.audit.begin(action="tool.invoke", config_version=context.config_version, **fields)
+    except BaseException:
+        admission.release()
+        context.circuits.abandon_probe(circuit_key)
+        context.behavior.release_tool()
+        raise
+    context.state.tool_calls += 1
     context.state.record("tool.started", **fields)
+    from .tool_caching import prepare_tool_cache
+    cache_ticket = prepare_tool_cache(context, metadata, name, function, args, kwargs, cache_options,
+                                      effect=effect, preflight=preflight)
     done = False
 
     def finish(error: BaseException | None = None, result: Any = None):
@@ -203,24 +237,51 @@ def _invoke(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *
         done = True
         context._pending.pop(metadata.request_id, None)
         admission.release()
+        context.behavior.release_tool()
         terminal = dict(fields, duration_seconds=monotonic() - started,
                         outcome="completed" if error is None else "timed_out" if isinstance(error, ExecutionTimeout)
                         else "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed")
         if error is None:
-            context.circuits.record_success(key)
+            context.behavior.output(result)
+            if cache_ticket is not None and cache_ticket.hit:
+                context.circuits.abandon_probe(circuit_key)
+            else:
+                context.circuits.record_success(circuit_key)
             context.state.record("tool.completed", **terminal, **result_summary(result))
         else:
             if not isinstance(error, (asyncio.CancelledError, ExecutionTimeout, GeneratorExit)):
-                context.circuits.record_failure(key, error)
+                context.circuits.record_failure(circuit_key, error)
             context.state.record("tool.failed", **terminal)
+            if isinstance(error, (asyncio.CancelledError, ExecutionTimeout, GeneratorExit)) or not context.circuits.is_provider_failure(error):
+                context.circuits.abandon_probe(circuit_key)
             if isinstance(error, ExecutionTimeout):
                 context.state.record("tool.timed_out", **terminal, reason_code=error.reason_code,
                                       execution_may_have_completed=effect != "read")
         context.state.record("tool.finished", **fields, duration_seconds=monotonic() - started)
+        if audit_operation is not None:
+            context.audit.end(audit_operation, outcome=terminal["outcome"],
+                              execution_may_have_completed=effect != "read", **fields)
+        if error is None and cache_ticket is not None:
+            cache_ticket.publish(result)
 
     token = current_call.set(metadata)
+    stack = tool_stack.get() + (name,)
+    stack_token = tool_stack.set(stack)
     deadline_token = current_deadline.set(deadline)
     try:
+        deadline.check()
+        if context.policy_valid is not None:
+            context.policy_valid()
+        if cache_ticket is not None:
+            from .caching import MISS
+            cached = cache_ticket.read()
+            if cached is not MISS:
+                fields["kind"] = "cache"
+                deadline.check()
+                if context.policy_valid is not None:
+                    context.policy_valid()
+                finish(result=cached)
+                return cached
         deadline.check()
         result = function(*args, **kwargs)
         if not isawaitable(result):
@@ -232,12 +293,14 @@ def _invoke(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *
         raise
     finally:
         current_call.reset(token)
+        tool_stack.reset(stack_token)
         current_deadline.reset(deadline_token)
 
     async def consume():
         from .runtime import _current_run
         run_token = _current_run.set(context)
         token = current_call.set(metadata)
+        stack_token = tool_stack.set(stack)
         deadline_token = current_deadline.set(deadline)
         try:
             deadline.check()
@@ -250,6 +313,7 @@ def _invoke(context: Any, name: str, function: Any, args: tuple, kwargs: dict, *
             raise
         finally:
             current_call.reset(token)
+            tool_stack.reset(stack_token)
             current_deadline.reset(deadline_token)
             _current_run.reset(run_token)
             if hasattr(result, "close"):

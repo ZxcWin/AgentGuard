@@ -2,6 +2,19 @@ class AgentGuardError(Exception):
     """AgentGuard 异常的基类。"""
 
 
+class AuditUnavailable(AgentGuardError):
+    """Required audit failed; new protected operations must stop."""
+    def __init__(self, *, execution_may_have_completed: bool = False, operation_id: str | None = None):
+        self.execution_may_have_completed = execution_may_have_completed
+        self.operation_id = operation_id
+        self.reason_code = "audit_unavailable"
+        super().__init__("Required audit storage is unavailable")
+
+
+class PolicyUnavailable(AgentGuardError):
+    """No valid, scoped remote policy is available for admission."""
+
+
 class ConfigurationError(AgentGuardError, ValueError):
     """配置值无效时抛出。"""
 
@@ -36,6 +49,25 @@ class ExecutionTimeout(AgentGuardError, TimeoutError):
         super().__init__(f"{scope} execution deadline exceeded")
 
 
+class QualityViolation(AgentGuardError):
+    """A configured quality gate rejected a model response."""
+
+    def __init__(self, reason: str | None = None, *, action: str = "block") -> None:
+        self.action = action
+        self.reason_code = "quality_failed"
+        super().__init__(reason or "model response failed quality checks")
+
+
+class SecurityViolation(AgentGuardError):
+    """A configured security gate rejected model input or output."""
+
+    def __init__(self, *, stage: str, finding_count: int) -> None:
+        self.stage = stage
+        self.finding_count = finding_count
+        self.reason_code = "security_blocked"
+        super().__init__(f"security policy blocked {stage} content")
+
+
 __all__ = [
     "AgentGuardError",
     "BudgetExceeded",
@@ -43,4 +75,8 @@ __all__ = [
     "ConfigurationError",
     "ExecutionTimeout",
     "RateLimitExceeded",
+    "QualityViolation",
+    "SecurityViolation",
+    "AuditUnavailable",
+    "PolicyUnavailable",
 ]

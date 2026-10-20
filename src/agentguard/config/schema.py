@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
@@ -214,6 +214,28 @@ class RateLimitConfig:
 
 
 @dataclass(frozen=True)
+class CircuitConfig:
+    failure_threshold: int = 5
+    recovery_seconds: float = 30.0
+    max_keys: int = 10_000
+
+    def __post_init__(self) -> None:
+        if type(self.failure_threshold) is not int or not 1 <= self.failure_threshold <= 1_000_000:
+            raise ConfigurationError("circuit.failure_threshold must be an integer between 1 and 1000000")
+        if type(self.max_keys) is not int or not 1 <= self.max_keys <= 100_000:
+            raise ConfigurationError("circuit.max_keys must be an integer between 1 and 100000")
+        recovery = _optional_float(self.recovery_seconds, "circuit.recovery_seconds")
+        if recovery is None or recovery > 86400:
+            raise ConfigurationError("circuit.recovery_seconds must be between 0 and 86400")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "CircuitConfig":
+        values = _mapping(values, "circuit")
+        _check_keys(values, set(cls.__dataclass_fields__), "circuit")
+        return cls(**values)
+
+
+@dataclass(frozen=True)
 class PricingConfig:
     version: str = "1"
     models: Mapping[str, ModelPriceConfig] = field(default_factory=dict)
@@ -302,17 +324,22 @@ class DegradationConfig:
 class TelemetryConfig:
     verbose: bool = True
     enable_metrics_export: bool = False
+    retention_days: int = 7
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "TelemetryConfig":
         values = _mapping(values, "telemetry")
         _check_keys(values, set(cls.__dataclass_fields__), "telemetry")
-        for key in cls.__dataclass_fields__:
+        days = values.get("retention_days", 7)
+        if type(days) is not int or not 1 <= days <= 30:
+            raise ConfigurationError("telemetry.retention_days must be between 1 and 30")
+        for key in ("verbose", "enable_metrics_export"):
             if key in values and not isinstance(values[key], bool):
                 raise ConfigurationError(f"telemetry.{key} 必须是布尔值")
         return cls(
             verbose=values.get("verbose", True),
             enable_metrics_export=values.get("enable_metrics_export", False),
+            retention_days=days,
         )
 
 
@@ -366,6 +393,8 @@ class ToolConfig:
     idempotency_required_for: tuple[str, ...] = ()
     approval_required_for: tuple[str, ...] = ()
     approval_timeout_seconds: float | None = None
+    max_depth: int | None = None
+    max_concurrent: int | None = None
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "ToolConfig":
@@ -392,7 +421,136 @@ class ToolConfig:
                    per_tool_limits=checked_limits, side_effects=dict(effects),
                    idempotency_required_for=tool_names(values.get("idempotency_required_for", []), "tools.idempotency_required_for"),
                    approval_required_for=tool_names(values.get("approval_required_for", []), "tools.approval_required_for"),
-                   approval_timeout_seconds=_optional_float(values.get("approval_timeout_seconds"), "tools.approval_timeout_seconds"))
+                   approval_timeout_seconds=_optional_float(values.get("approval_timeout_seconds"), "tools.approval_timeout_seconds"),
+                   max_depth=_optional_int(values.get("max_depth"), "tools.max_depth"),
+                   max_concurrent=_optional_int(values.get("max_concurrent"), "tools.max_concurrent"))
+
+
+@dataclass(frozen=True)
+class BehaviorConfig:
+    max_repeated_outputs: int | None = None
+    max_calls_without_progress: int | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "BehaviorConfig":
+        values = _mapping(values, "behavior")
+        _check_keys(values, set(cls.__dataclass_fields__), "behavior")
+        return cls(**{key: _optional_int(values.get(key), f"behavior.{key}") for key in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True)
+class SecurityConfig:
+    enabled: bool = False
+    action: str = "block"
+    detect_secrets: bool = True
+    detect_pii: bool = False
+    detect_prompt_injection: bool = True
+    max_chars: int = 200_000
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "SecurityConfig":
+        values = _mapping(values, "security")
+        _check_keys(values, set(cls.__dataclass_fields__), "security")
+        _validate_gate({**values, "action": "block"}, "security", ("enabled", "detect_secrets", "detect_pii", "detect_prompt_injection"))
+        if not isinstance(values.get("action", "block"), str) or values.get("action", "block") not in {"block", "observe", "redact"}:
+            raise ConfigurationError("security.action must be block, observe or redact")
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class QualityConfig:
+    enabled: bool = False
+    action: str = "block"
+    strict_json: bool = False
+    max_chars: int = 200_000
+    json_schema: Mapping[str, Any] | bool | None = None
+    max_retries: int = 0
+    min_chars: int = 0
+    required_substrings: tuple[str, ...] = ()
+    handler_timeout_seconds: float = 30.0
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "QualityConfig":
+        values = _mapping(values, "quality")
+        _check_keys(values, set(cls.__dataclass_fields__), "quality")
+        _validate_gate({**values, "action": "block"}, "quality", ("enabled", "strict_json"))
+        if not isinstance(values.get("action", "block"), str) or values.get("action", "block") not in {"block", "observe", "retry", "repair", "degrade", "human"}:
+            raise ConfigurationError("invalid quality.action")
+        timeout = _optional_float(values.get("handler_timeout_seconds", 30), "quality.handler_timeout_seconds")
+        if timeout is None or not 0 < timeout <= 300:
+            raise ConfigurationError("quality.handler_timeout_seconds must be between 0 and 300")
+        count = values.get("max_retries", 0)
+        minimum = values.get("min_chars", 0)
+        if type(count) is not int or not 0 <= count <= 10:
+            raise ConfigurationError("quality.max_retries must be between 0 and 10")
+        if type(minimum) is not int or not 0 <= minimum <= values.get("max_chars", 200000):
+            raise ConfigurationError("quality.min_chars must be between 0 and max_chars")
+        required = _string_list(values.get("required_substrings", []), "quality.required_substrings")
+        if len(required) > 32 or any(len(item) > 256 for item in required):
+            raise ConfigurationError("quality.required_substrings exceeds limits")
+        schema = values.get("json_schema")
+        if schema is not None:
+            from ..adapters.validation.json_schema import build_validator
+            build_validator(schema)
+        from copy import deepcopy
+        return cls(**{**values, "json_schema": deepcopy(schema), "required_substrings": required})
+
+
+def _validate_gate(values: Mapping[str, Any], name: str, flags: tuple[str, ...]) -> None:
+    for key in flags:
+        if key in values and not isinstance(values[key], bool):
+            raise ConfigurationError(f"{name}.{key} must be a boolean")
+    action = values.get("action", "block")
+    if not isinstance(action, str) or action not in {"block", "observe"}:
+        raise ConfigurationError(f"{name}.action must be block or observe")
+    limit = values.get("max_chars", 200_000)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2_000_000:
+        raise ConfigurationError(f"{name}.max_chars must be between 1 and 2000000")
+
+
+@dataclass(frozen=True)
+class CacheConfig:
+    enabled: bool = False
+    ttl_seconds: int = 300
+    max_entries: int = 256
+    max_bytes: int = 16 * 1024 * 1024
+    allowed_models: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "CacheConfig":
+        values = _mapping(values, "cache")
+        _check_keys(values, set(cls.__dataclass_fields__), "cache")
+        if type(values.get("enabled", False)) is not bool:
+            raise ConfigurationError("cache.enabled must be a boolean")
+        limits = {}
+        for key, default, maximum in (("ttl_seconds", 300, 3600), ("max_entries", 256, 10000),
+                                      ("max_bytes", 16 * 1024 * 1024, 256 * 1024 * 1024)):
+            value = values.get(key, default)
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ConfigurationError(f"cache.{key} must be an integer between 1 and {maximum}")
+            limits[key] = value
+        models = _string_list(values.get("allowed_models", []), "cache.allowed_models")
+        if "*" in models:
+            raise ConfigurationError("cache.allowed_models cannot include wildcard")
+        tools = _string_list(values.get("allowed_tools", []), "cache.allowed_tools")
+        if "*" in tools:
+            raise ConfigurationError("cache.allowed_tools cannot include wildcard")
+        return cls(enabled=values.get("enabled", False), allowed_models=models, allowed_tools=tools, **limits)
+
+
+@dataclass(frozen=True)
+class EnforcementConfig:
+    profile: str = "development"
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "EnforcementConfig":
+        values = _mapping(values, "enforcement")
+        _check_keys(values, {"profile"}, "enforcement")
+        profile = values.get("profile", "development")
+        if not isinstance(profile, str) or profile not in {"development", "production"}:
+            raise ConfigurationError("enforcement.profile must be development or production")
+        return cls(profile=profile)
 
 
 @dataclass(frozen=True)
@@ -403,10 +561,60 @@ class AgentGuardConfig:
     pricing: PricingConfig = field(default_factory=PricingConfig)
     degradation: DegradationConfig = field(default_factory=DegradationConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    circuit: CircuitConfig = field(default_factory=CircuitConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     tools: ToolConfig = field(default_factory=ToolConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
+    enforcement: EnforcementConfig = field(default_factory=EnforcementConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
+    behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
+
+    def __post_init__(self) -> None:
+        CacheConfig.from_mapping(asdict(self.cache))
+        CircuitConfig.from_mapping(asdict(self.circuit))
+        if self.enforcement.profile not in {"development", "production"}:
+            raise ConfigurationError("enforcement.profile must be development or production")
+        if self.enforcement.profile != "production":
+            return
+        # Direct dataclass construction must obey the same strict validation
+        # as Mapping/YAML and hot updates.
+        for schema, section in (
+            (TokenConfig, self.token), (BudgetConfig, self.budget),
+            (PricingConfig, self.pricing), (RateLimitConfig, self.rate_limit),
+            (SecurityConfig, self.security),
+        ):
+            schema.from_mapping(asdict(section))
+        requirements = (
+            (self.token.max_output_tokens is not None and self.token.max_output_tokens > 0,
+             "token.max_output_tokens must be positive"),
+            (self.token.run_token_budget is not None, "token.run_token_budget is required"),
+            (self.budget.run_cost_usd is not None, "budget.run_cost_usd is required"),
+            (self.token.missing_price == "reject", "token.missing_price must be reject"),
+            (self.token.missing_usage in {"estimate", "reject"}, "token.missing_usage cannot be unknown"),
+            (bool(self.pricing.models) and "*" not in self.pricing.models,
+             "pricing.models must list explicit model prices without wildcard"),
+            (self.security.enabled and self.security.action == "block" and self.security.detect_secrets,
+             "security must be enabled with action=block and detect_secrets=true"),
+            (self.rate_limit.redis_failure_policy == "reject", "rate_limit.redis_failure_policy must be reject"),
+        )
+        for valid, message in requirements:
+            if not valid:
+                raise ConfigurationError(f"production profile: {message}")
+
+    @classmethod
+    def for_production(cls, values: Mapping[str, Any]) -> "AgentGuardConfig":
+        """Opt in to strict local enforcement; caller supplies budgets and prices."""
+        from .merge import deep_merge
+
+        config = deep_merge({
+            "token": {"missing_price": "reject", "missing_usage": "estimate"},
+            "security": {"enabled": True, "action": "block", "detect_secrets": True},
+        }, _mapping(values, "production configuration"))
+        config["enforcement"] = {"profile": "production"}
+        return cls.from_mapping(config)
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "AgentGuardConfig":
@@ -417,6 +625,15 @@ class AgentGuardConfig:
             raise ConfigurationError("schema_version 必须是整数")
         if schema_version != SCHEMA_VERSION:
             raise ConfigurationError(f"不支持的 schema_version：{schema_version}")
+        enforcement = EnforcementConfig.from_mapping(values.get("enforcement"))
+        if enforcement.profile == "production":
+            prices = _mapping(_mapping(values.get("pricing"), "pricing").get("models"), "pricing.models")
+            for name, price in prices.items():
+                if not isinstance(name, str) or not name.strip() or name != name.strip():
+                    raise ConfigurationError("production profile: model names must be nonempty strings without whitespace")
+                fields = _mapping(price, "pricing model")
+                if any(fields.get(key) is None for key in ("input_per_million", "output_per_million")):
+                    raise ConfigurationError("production profile: explicit input_per_million and output_per_million are required")
         return cls(
             schema_version=schema_version,
             token=TokenConfig.from_mapping(values.get("token")),
@@ -424,10 +641,16 @@ class AgentGuardConfig:
             pricing=PricingConfig.from_mapping(values.get("pricing")),
             degradation=DegradationConfig.from_mapping(values.get("degradation")),
             rate_limit=RateLimitConfig.from_mapping(values.get("rate_limit")),
+            circuit=CircuitConfig.from_mapping(values.get("circuit")),
             telemetry=TelemetryConfig.from_mapping(values.get("telemetry")),
             timeout=TimeoutConfig.from_mapping(values.get("timeout")),
             tools=ToolConfig.from_mapping(values.get("tools")),
             retry=RetryConfig.from_mapping(values.get("retry")),
+            security=SecurityConfig.from_mapping(values.get("security")),
+            quality=QualityConfig.from_mapping(values.get("quality")),
+            enforcement=enforcement,
+            cache=CacheConfig.from_mapping(values.get("cache")),
+            behavior=BehaviorConfig.from_mapping(values.get("behavior")),
         )
 
     @classmethod

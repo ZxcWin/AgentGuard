@@ -2,6 +2,9 @@ from .api import AgentGuard, RunContext, current_run, guard
 from .application import BaseInterceptor, InterceptorChain
 from .config import (
     AgentGuardConfig,
+    CacheConfig,
+    CircuitConfig,
+    EnforcementConfig,
     BudgetConfig,
     ConfigManager,
     ConfigSnapshot,
@@ -9,18 +12,36 @@ from .config import (
     PricingConfig,
     RateLimitConfig,
     TokenConfig,
+    SecurityConfig,
+    QualityConfig,
     deep_merge,
     environment_mapping,
     load_config,
 )
 from .domain import CallContext, RequestSnapshot, RunState, Usage
+from .domain.cache import CacheRequest, ToolCacheRequest
+from .domain.quality import QualityRequest, QualityFailure, QualityDecision, QualityRecovery
+from .adapters.storage.exact_cache import MemoryExactCache
+from .adapters.storage.sqlite_cache import SQLiteExactCache
+from .adapters.events import MemoryEventSink, JSONLEventSink, CallbackEventSink, CallbackBatchEventSink
+from .adapters.telemetry.otel import OpenTelemetryEventSink
+from .policies.telemetry import EventSampling
+from .adapters.storage.audit import SQLiteAuditStore
+from .adapters.storage.redis_budget import RedisBudgetStore
+from .adapters.storage.ledger import SQLiteCostLedger
+from .config.remote import RemoteConfigManager
+from .adapters.remote_policy import PolicyVerifier, HTTPPolicyProvider
 from .domain.exceptions import (
     AgentGuardError,
+    AuditUnavailable,
+    PolicyUnavailable,
     BudgetExceeded,
     CircuitOpen,
     ConfigurationError,
     RateLimitExceeded,
     ExecutionTimeout,
+    QualityViolation,
+    SecurityViolation,
 )
 from .adapters.storage import MemoryCache, RedisAdmissionBackend, RedisAdmissionController, RedisAdmissionLease, RedisControllerLease, make_cache_key
 from .policies import (
@@ -36,13 +57,42 @@ from .policies import (
     QualityAction,
     QualityGuard,
     QualityResult,
+    SecurityAction,
+    SecurityFinding,
+    SecurityGuard,
+    SecurityResult,
     RateLimiter,
     ToolGuard,
     estimate_tokens,
 )
 
 __all__ = [
+    "CallbackBatchEventSink",
+    "OpenTelemetryEventSink",
+    "EventSampling",
+    "SQLiteExactCache",
+    "QualityRequest",
+    "QualityFailure",
+    "QualityDecision",
+    "QualityRecovery",
+    "RedisBudgetStore",
+    "SQLiteCostLedger",
+    "RemoteConfigManager",
+    "PolicyVerifier",
+    "HTTPPolicyProvider",
+    "SQLiteAuditStore",
+    "AuditUnavailable",
+    "PolicyUnavailable",
+    "MemoryEventSink",
+    "JSONLEventSink",
+    "CallbackEventSink",
     "AgentGuardConfig",
+    "CacheConfig",
+    "CircuitConfig",
+    "CacheRequest",
+    "ToolCacheRequest",
+    "MemoryExactCache",
+    "EnforcementConfig",
     "AgentGuard",
     "AgentGuardError",
     "AdmissionController",
@@ -60,6 +110,8 @@ __all__ = [
     "CircuitOpen",
     "ConfigurationError",
     "ExecutionTimeout",
+    "QualityViolation",
+    "SecurityViolation",
     "InterceptorChain",
     "LoopDetected",
     "ToolApprovalDenied",
@@ -71,6 +123,12 @@ __all__ = [
     "QualityAction",
     "QualityGuard",
     "QualityResult",
+    "SecurityAction",
+    "SecurityFinding",
+    "SecurityGuard",
+    "SecurityConfig",
+    "QualityConfig",
+    "SecurityResult",
     "RateLimitConfig",
     "RateLimitExceeded",
     "RateLimiter",

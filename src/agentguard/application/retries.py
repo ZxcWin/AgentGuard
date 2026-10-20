@@ -10,6 +10,7 @@ from time import sleep
 from typing import Any
 
 from ..policies.retry import retry_after, retry_reason
+from ..domain.exceptions import QualityViolation
 from .deadlines import current_deadline, inherited_deadline
 
 
@@ -20,6 +21,8 @@ class Attempt:
     tools_before: int
     call: Any = None
     provider_error: BaseException | None = None
+    purpose: str = "primary"
+    fallback_active: bool = False
 
 
 current_attempt: ContextVar[Attempt | None] = ContextVar("agentguard_retry_attempt", default=None)
@@ -29,17 +32,25 @@ class RetrySession:
     def __init__(self, context, function, args, kwargs, purpose):
         self.context, self.function, self.args, self.kwargs, self.purpose = context, function, args, kwargs, purpose
         self.config = context.config.retry
+        self.transport_retries = 0
+        self.quality_retries = 0
+        self.next_purpose = purpose
+        self.fallback_active = False
+        self.recovery_used = set()
+        self.recovery_step = None
+        self.max_attempts = 1 + self.config.max_retries + context.config.quality.max_retries
         self.deadline = inherited_deadline(context.deadline).child(context.config.timeout.llm_seconds, "llm").child(self.config.max_elapsed_seconds, "retry")
 
     def invoke(self, attempt):
         from .runtime import _invoke_once
         self.context._check()
+        attempt.fallback_active = self.fallback_active
         self.deadline.check()
         token = current_attempt.set(attempt)
         deadline_token = current_deadline.set(self.deadline)
         try:
             return _invoke_once(self.context, self.function, *self.args,
-                                budget_purpose=self.purpose if attempt.number == 1 else "retry", **self.kwargs)
+                                budget_purpose=attempt.purpose, **self.kwargs)
         finally:
             current_attempt.reset(token)
             current_deadline.reset(deadline_token)
@@ -48,14 +59,21 @@ class RetrySession:
         call = attempt.call
         fields = dict(attempt=attempt.number, request_id=call.metadata.request_id if call else None)
         reason = retry_reason(error)
+        quality = isinstance(error, QualityViolation) and error.action in {"retry", "repair", "degrade", "human"} and call is not None and call.quality_error is error
+        if quality:
+            reason = "quality_failed"
         stopped = None
-        if attempt.provider_error is not error or reason is None:
+        if not quality and (attempt.provider_error is not error or reason is None):
             stopped = "not_retryable"
         elif call is not None and call.admitted.kwargs.get("stream") is True:
             stopped = "streaming"
         elif self.context.state.tool_calls != attempt.tools_before:
             stopped = "nested_tool_executed"
-        elif attempt.number > self.config.max_retries:
+        elif quality and self.quality_retries >= self.context.config.quality.max_retries:
+            stopped = "quality_max_retries"
+        elif quality and error.action in {"degrade", "human"} and error.action in self.recovery_used:
+            stopped = "quality_recovery_already_used"
+        elif not quality and self.transport_retries >= self.config.max_retries:
             stopped = "max_retries"
         base = min(self.config.max_delay_seconds, self.config.initial_delay_seconds * 2 ** (attempt.number - 1))
         delay = uniform(0, base) if self.config.jitter else base
@@ -68,8 +86,22 @@ class RetrySession:
         if stopped is None and remaining is not None and delay >= remaining:
             stopped = "retry_time_budget"
         if stopped is not None:
+            if call is not None:
+                call.quality_response = None
             self.context.state.record("llm.retry_stopped", **fields, reason_code=stopped)
             return None
+        if quality:
+            self.quality_retries += 1
+            self.next_purpose = "fallback" if error.action == "degrade" else "quality_retry"
+            if error.action != "retry":
+                from .quality_recovery import RecoveryStep
+                self.recovery_used.add(error.action)
+                self.recovery_step = RecoveryStep(self, error, attempt)
+            else:
+                call.quality_response = None
+        else:
+            self.transport_retries += 1
+            self.next_purpose = "retry"
         self.context.state.record("llm.retry_scheduled", **fields, reason_code=reason, delay_seconds=delay)
         return delay
 
@@ -77,8 +109,8 @@ class RetrySession:
         self.context._retry_sessions += 1
         try:
             starting_number = initial_attempt.number if initial_attempt is not None else 1
-            for number in range(starting_number, self.config.max_retries + 2):
-                attempt = initial_attempt if number == starting_number and initial_attempt is not None else Attempt(self.context, number, self.context.state.tool_calls)
+            for number in range(starting_number, self.max_attempts + 1):
+                attempt = initial_attempt if number == starting_number and initial_attempt is not None else Attempt(self.context, number, self.context.state.tool_calls, purpose=self.next_purpose)
                 token = current_attempt.set(attempt)
                 deadline_token = current_deadline.set(self.deadline)
                 try:
@@ -89,6 +121,9 @@ class RetrySession:
                         delay = self.delay(error, attempt)
                         if delay is None:
                             raise
+                        if self.recovery_step is not None:
+                            step, self.recovery_step = self.recovery_step, None
+                            await step.async_run()
                 finally:
                     current_attempt.reset(token)
                     current_deadline.reset(deadline_token)
@@ -99,8 +134,8 @@ class RetrySession:
     def sync_run(self):
         self.context._retry_sessions += 1
         try:
-            for number in range(1, self.config.max_retries + 2):
-                attempt = Attempt(self.context, number, self.context.state.tool_calls)
+            for number in range(1, self.max_attempts + 1):
+                attempt = Attempt(self.context, number, self.context.state.tool_calls, purpose=self.next_purpose)
                 try:
                     result = self.invoke(attempt)
                     if isawaitable(result):
@@ -112,6 +147,9 @@ class RetrySession:
                     delay = self.delay(error, attempt)
                     if delay is None:
                         raise
+                    if self.recovery_step is not None:
+                        step, self.recovery_step = self.recovery_step, None
+                        step.sync()
                 sleep(delay)
                 self.deadline.check()
         finally:

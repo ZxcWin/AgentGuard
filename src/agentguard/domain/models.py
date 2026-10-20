@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 __all__ = ["CallContext", "RequestSnapshot", "RunState", "Usage", "utc_now"]
 from uuid import uuid4
@@ -22,8 +22,10 @@ class Usage:
 
     def __post_init__(self) -> None:
         values = (self.input_tokens, self.output_tokens, self.cached_tokens, self.reasoning_tokens)
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        if any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10**12 for value in values):
             raise ValueError("usage 的 Token 数必须是非负整数")
+        if self.cached_tokens > self.input_tokens or self.reasoning_tokens > self.output_tokens:
+            raise ValueError("Cached/reasoning tokens must be subsets of input/output tokens")
         if self.source not in {"provider", "tokenizer", "estimate", "unknown"}:
             raise ValueError("usage 来源必须是 provider、tokenizer、estimate 或 unknown")
 
@@ -80,6 +82,7 @@ class RunState:
     retry_count: int = 0
     status: str = "running"
     events: list[dict[str, Any]] = field(default_factory=list)
+    event_observer: Callable[[dict[str, Any]], None] | None = field(default=None, repr=False, compare=False)
 
     @property
     def total_tokens(self) -> int:
@@ -96,7 +99,16 @@ class RunState:
         self.estimated_cost_usd += cost_usd
 
     def record(self, event: str, **data: Any) -> None:
-        self.events.append({"event": event, "timestamp": utc_now().isoformat(), **data})
+        value = {**data, "event": event, "timestamp": utc_now().isoformat(),
+                 "event_id": f"evt_{uuid4().hex}", "schema_version": 1,
+                 "run_id": self.run_id, "trace_id": self.trace_id}
+        self.events.append(value)
+        if self.event_observer is not None:
+            try:
+                self.event_observer(dict(value))
+            except Exception:
+                # Ordinary telemetry must never change the result of a protected call.
+                pass
 
     def summary(self) -> dict[str, Any]:
         return {

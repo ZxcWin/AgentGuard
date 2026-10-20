@@ -1,0 +1,102 @@
+name: SDK and console checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  sdk:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip setuptools wheel
+      - run: python -m pip install -e ".[test,yaml,quality,redis,redis-test,console,console-test,otel]"
+      - run: python -m pytest -q
+      - run: python -m pip wheel --no-deps --no-build-isolation --wheel-dir dist .
+      - run: python tools/release_check.py
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: python -m pip install -e ".[console,console-test]"
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run test:e2e
+        working-directory: frontend
+      - run: python -m pip install --upgrade setuptools wheel
+      - run: python -m pip wheel --no-deps --no-build-isolation --wheel-dir dist .
+      - run: python tools/release_check.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentguard-sdk-and-console
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: console-test-results
+          path: frontend/test-results
+  redis:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      AGENTGUARD_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e ".[test,redis,redis-test]"
+      - run: python -m pytest -q tests/unit/test_shared_budget.py tests/integration/test_real_redis_budget.py
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -e ".[console,quality,redis,yaml,otel]" pip-audit
+      - run: python -m pip_audit --local
+      - run: npm ci
+        working-directory: frontend
+      - run: npm audit --audit-level=high
+        working-directory: frontend

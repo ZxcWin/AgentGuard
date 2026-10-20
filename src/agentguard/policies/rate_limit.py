@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import Condition, Lock
+from threading import Condition, Lock, RLock
 from time import monotonic, sleep
 from typing import Any, Iterator
 
@@ -137,6 +137,10 @@ class CircuitBreaker:
                 self.opened_at = monotonic()
             self.probe_in_flight = False
 
+    def abandon_probe(self) -> None:
+        with self._lock:
+            self.probe_in_flight = False
+
 
 class CircuitRegistry:
     """为受限数量的 scope key 保存相互独立的熔断器。"""
@@ -185,6 +189,9 @@ class CircuitRegistry:
     def record_success(self, key: str) -> None:
         self.get(key).record_success()
 
+    def abandon_probe(self, key: str) -> None:
+        self.get(key).abandon_probe()
+
 class AdmissionLease:
     def __init__(self, limiter: "AdmissionController", key: str, tool: bool = False) -> None:
         self._limiter = limiter
@@ -206,7 +213,18 @@ class AdmissionController:
         self.config = config
         self._states: dict[str, tuple[RateLimiter, ConcurrencyLimiter]] = {}
         self._last_used: dict[str, float] = {}
-        self._lock = Lock()
+        self._lock = RLock()
+
+    @staticmethod
+    def _idle(state, now):
+        limiter, concurrency = state
+        if concurrency._active:
+            return False
+        for window in (limiter.request_limiter, limiter.token_limiter, limiter.tool_limiter):
+            with window._lock:
+                window._prune(now)
+                if window._events: return False
+        return True
 
     def _state(self, key: str) -> tuple[RateLimiter, ConcurrencyLimiter]:
         with self._lock:
@@ -219,8 +237,8 @@ class AdmissionController:
             if len(self._states) >= max_keys:
                 idle_keys = [
                     candidate
-                    for candidate, (_, concurrency) in self._states.items()
-                    if concurrency._active == 0 and candidate != key
+                    for candidate, candidate_state in self._states.items()
+                    if candidate != key and self._idle(candidate_state, current_time)
                 ]
                 if idle_keys:
                     expired_key = min(idle_keys, key=self._last_used.get)
@@ -236,6 +254,10 @@ class AdmissionController:
     def try_acquire(
         self, tokens: int = 1, *, key: str = "*", tool: bool = False
     ) -> AdmissionLease | None:
+        with self._lock:
+            return self._try_acquire(tokens, key=key, tool=tool)
+
+    def _try_acquire(self, tokens, *, key, tool):
         limiter, concurrency = self._state(key)
         if tool:
             if not limiter.tool_limiter.try_acquire(1):
@@ -274,10 +296,10 @@ class AdmissionController:
             sleep(0.01 if deadline is None else min(0.05, max(0.0, deadline - monotonic())))
 
     def _release(self, key: str) -> None:
-        _, concurrency = self._state(key)
-        with concurrency._condition:
-            if concurrency._active > 0:
-                concurrency._active -= 1
-                concurrency._condition.notify()
         with self._lock:
+            _, concurrency = self._states[key]
+            with concurrency._condition:
+                if concurrency._active > 0:
+                    concurrency._active -= 1
+                    concurrency._condition.notify()
             self._last_used[key] = monotonic()

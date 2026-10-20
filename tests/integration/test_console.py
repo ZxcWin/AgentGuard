@@ -8,6 +8,8 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
 from agentguard.api.http import create_app
+from agentguard.adapters.storage.sqlite import SQLiteRunStore
+from agentguard.adapters.storage.sqlite_policy import SQLitePolicyStore
 from agentguard.config.manager import ConfigManager, ConfigVersionConflict
 
 
@@ -38,6 +40,32 @@ def test_sdk_to_sqlite_to_http_and_no_payload_leaks(client):
     assert Decimal(overview["estimated_cost_usd"]) > 0
 
 
+def test_independent_agent_process_uses_shared_database_and_policy(tmp_path):
+    from examples.console_agent import run_agent
+    database = tmp_path / 'shared' / 'runs.db'
+    with TestClient(create_app(database=database)) as console:
+        initial = console.get('/api/v1/policies/current').json()
+        policy = {'expected_version': initial['version'], 'config': {
+            'token': {'run_token_budget': 1000},
+            'tools': {'max_calls': 2, 'side_effects': {'knowledge_lookup': 'read'}},
+        }}
+        assert console.put('/api/v1/policies/current', json=policy).status_code == 200
+
+        result = run_agent(database, 'check cross-process monitoring')
+        rows = console.get('/api/v1/runs', params={'search': result['run_id']}).json()
+        assert rows['total'] == 1
+        assert rows['items'][0]['run_id'] == result['run_id']
+        assert rows['items'][0]['config_version'] == initial['version'] + 1
+        assert rows['items'][0]['llm_calls'] == 2
+        assert rows['items'][0]['tool_calls'] == 1
+        detail = console.get(f"/api/v1/runs/{result['run_id']}").json()
+        assert detail['status'] == 'completed'
+        assert {'llm.completed', 'tool.completed', 'run.completed'} <= {event['event'] for event in detail['events']}
+        assert all('check cross-process monitoring' not in str(event) for event in detail['events'])
+        overview = console.get('/api/v1/overview').json()
+        assert overview['runs'] == 1 and overview['calls'] == 2 and overview['tokens'] > 0
+
+
 def test_policy_validate_update_conflict_and_run_snapshots(client):
     guard = client.app.state.guard
     old_run = guard.run("old")
@@ -49,6 +77,50 @@ def test_policy_validate_update_conflict_and_run_snapshots(client):
     assert client.put("/api/v1/policies/current", json=change).status_code == 409
     assert old_run.config.token.run_token_budget == 32000
     assert guard.run("new").config.token.run_token_budget == 500
+
+
+def test_circuit_policy_real_demo_stops_before_second_provider_call(tmp_path):
+    with TestClient(create_app(database=tmp_path / 'circuit.db', demo=True)) as client:
+        guard = client.app.state.guard
+        old = guard.run('old-policy')
+        policy = client.get('/api/v1/policies/current').json()
+        change = {'expected_version': policy['version'], 'config': {
+            'circuit': {'failure_threshold': 1, 'recovery_seconds': 60, 'max_keys': 100},
+            'retry': {'max_retries': 0}}}
+        assert client.post('/api/v1/policies/validate', json=change).status_code == 200
+        assert guard.snapshot()[1] == policy['version']
+        saved = client.put('/api/v1/policies/current', json=change)
+        assert saved.status_code == 200
+        assert old.circuits.failure_threshold == 5
+        assert guard.run().circuits.failure_threshold == 1
+        assert client.put('/api/v1/policies/current', json=change).status_code == 409
+        generated = client.post('/api/v1/demo/runs?scenario=circuit')
+        assert generated.status_code == 200
+        run = client.get('/api/v1/runs/' + generated.json()['run_id']).json()
+        assert run['status'] == 'failed' and run['llm_calls'] == 1
+        assert any(e['event'] == 'circuit.rejected' for e in run['events'])
+        assert run['config_version'] == saved.json()['version']
+        assert 'Local simulated provider failure' not in str(run)
+
+
+def test_security_quality_policy_enforcement_and_metadata(client):
+    from agentguard import SecurityViolation, QualityViolation
+    saved = client.put('/api/v1/policies/current', json={'expected_version': 1, 'config': {
+        'security': {'enabled': True}, 'quality': {'enabled': True, 'strict_json': True}}})
+    assert saved.status_code == 200
+    guard = client.app.state.guard
+    with pytest.raises(SecurityViolation), guard.run('security') as run:
+        run.invoke(lambda **kw: 'never', messages='api_key=local-placeholder-secret')
+    row = client.get('/api/v1/runs/' + run.state.run_id).json()
+    assert row['blocked'] == 1 and row['llm_calls'] == 0 and row['status'] == 'failed'
+    assert 'local-placeholder-secret' not in str(row)
+    assert any(e['event'] == 'security.finding' and e['reason_code'] == 'secret.assignment' and e['stage'] == 'request' for e in row['events'])
+    with pytest.raises(QualityViolation), guard.run('quality') as run:
+        run.invoke(lambda **kw: {'content': 'private bad content', 'usage': {'input_tokens': 2, 'output_tokens': 3}}, model='local-example')
+    row = client.get('/api/v1/runs/' + run.state.run_id).json()
+    assert row['blocked'] == 1 and row['total_tokens'] == 5 and row['status'] == 'failed'
+    assert 'private bad content' not in str(row)
+    assert any(e['event'] == 'quality.rejected' and e['action'] == 'block' and e['evaluator_version'] == 'builtin-1' for e in row['events'])
 
 
 def test_tool_safety_policy_enforcement_audit_and_http_redaction(client):
@@ -84,6 +156,8 @@ def test_tool_safety_policy_enforcement_audit_and_http_redaction(client):
     {"token": {"run_token_budget": -1}}, {"token": {"run_token_budget": True}},
     {"token": {"reservation_buffer": 4}}, {"rate_limit": {"redis_url": "redis://secret"}},
     {"telemetry": {"verbose": False}}, {"token": []},
+    {"circuit": {"failure_threshold": 0}}, {"circuit": {"max_keys": True}},
+    {"circuit": {"recovery_seconds": None}}, {"circuit": {"recovery_seconds": -1}},
 ])
 def test_invalid_policy_does_not_change_version(client, config):
     response = client.put("/api/v1/policies/current", json={"config": config, "expected_version": 1})

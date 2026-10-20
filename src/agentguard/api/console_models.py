@@ -22,6 +22,9 @@ class HealthView(BaseModel):
     storage: str
     policy_scope: str
     policy_persistence: str
+    authentication: str = "local"
+    cache_backend: str = "memory"
+    cache_scope: str = "local_process"
 
 
 class EventView(BaseModel):
