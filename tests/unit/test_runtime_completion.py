@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import time
 import warnings
 
 import pytest

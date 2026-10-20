@@ -8,8 +8,6 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
 from agentguard.api.http import create_app
-from agentguard.adapters.storage.sqlite import SQLiteRunStore
-from agentguard.adapters.storage.sqlite_policy import SQLitePolicyStore
 from agentguard.config.manager import ConfigManager, ConfigVersionConflict
 
 

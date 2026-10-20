@@ -1,10 +1,8 @@
 import threading
-import time
-
 import pytest
 
 from agentguard import AgentGuard, CircuitBreaker, RateLimitExceeded
-from agentguard.policies.rate_limit import AdmissionController, SlidingWindowLimiter
+from agentguard.policies.rate_limit import AdmissionController
 from agentguard.config import AgentGuardConfig
 
 

@@ -1,7 +1,4 @@
 """Compose local hard limits with injected shared atomic budget reservations."""
-from decimal import Decimal
-
-
 class SharedBudgetManager:
     def __init__(self,local,store):
         self.local,self.store = local,store

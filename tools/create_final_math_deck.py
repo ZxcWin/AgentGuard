@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from shutil import copyfile
 from zipfile import ZIP_DEFLATED, ZipFile
-from xml.sax.saxutils import escape
 import xml.etree.ElementTree as ET
 
 from create_simplified_math_deck import NS_A, NS_P, NS_R, esc

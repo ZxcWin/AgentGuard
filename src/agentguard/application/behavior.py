@@ -3,7 +3,7 @@ from contextvars import ContextVar
 from hashlib import sha256
 from threading import RLock
 
-from ..policies.content import text_content, ContentLimit
+from ..policies.content import text_content
 from ..policies.tools import LoopDetected
 
 

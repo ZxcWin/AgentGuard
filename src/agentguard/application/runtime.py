@@ -31,7 +31,7 @@ from uuid import uuid4
 from inspect import iscoroutinefunction
 from .deadlines import Deadline, current_deadline, inherited_deadline
 from .lifecycle import CallLifecycle, current_call, dispatch
-from ..domain.exceptions import AgentGuardError, ExecutionTimeout
+from ..domain.exceptions import ExecutionTimeout
 from ..policies.security import SecurityGuard
 from ..policies.quality import QualityGuard
 from ..domain.cache import CacheRequest, ToolCacheRequest

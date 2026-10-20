@@ -9,7 +9,7 @@ from threading import RLock
 from typing import Any
 
 from ...domain.models import RunState
-from ...domain.events import EVENT_FIELDS, operational_event
+from ...domain.events import operational_event
 
 
 # Only operational metadata crosses the storage boundary. Payloads are excluded.

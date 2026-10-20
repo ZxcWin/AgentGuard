@@ -32,12 +32,10 @@ from ..adapters.events import MemoryEventSink
 from ..adapters.storage.audit import SQLiteAuditStore
 from ..adapters.storage.ledger import SQLiteCostLedger
 from ..adapters.storage.sqlite_cache import SQLiteExactCache
-from ..application.audit import AuditCoordinator
 from ..application.runtime import AgentGuard
 from ..config.manager import ConfigManager, ConfigVersionConflict
-from ..config.merge import deep_merge
 from ..config.schema import AgentGuardConfig
-from ..domain.exceptions import AgentGuardError, BudgetExceeded, ConfigurationError, AuditUnavailable
+from ..domain.exceptions import AgentGuardError, ConfigurationError, AuditUnavailable
 from ..domain.cache import CacheRequest, ToolCacheRequest
 
 EDITABLE = {

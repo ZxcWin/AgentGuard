@@ -7,7 +7,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
