@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import sqlite3
 import re
+import os
 from threading import RLock
 
 from .console_models import EventView, HealthView, OverviewView, Page, PolicyView, RunDetail, RunView
@@ -88,7 +89,7 @@ def create_app(*, database: str | Path = ".agentguard/runs.db", demo: bool = Fal
                credentials: ConsoleCredentials | None = None, public_hosts: tuple[str, ...] = (),
                policy_signing_key: bytes | None = None, policy_scope: dict[str, str] | None = None,
                cache_database: str | Path | None = None, cache_signing_key: bytes | None = None,
-               llm_upstream_url: str | None = None) -> FastAPI:
+               llm_upstream_url: str | None = None, llm_project: str = "default") -> FastAPI:
     if (cache_database is None) != (cache_signing_key is None):
         raise ValueError("Persistent cache requires both cache_database and cache_signing_key")
     if cache_signing_key is not None and (type(cache_signing_key) is not bytes or not 32 <= len(cache_signing_key) <= 4096):
@@ -98,6 +99,8 @@ def create_app(*, database: str | Path = ".agentguard/runs.db", demo: bool = Fal
             raise ValueError("Signed policy service requires credentials, a 32-byte signing key and exact scope")
     if public_hosts and credentials is None:
         raise ValueError("Remote hosts require server-side credentials")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", llm_project):
+        raise ValueError("LLM project name may contain letters, numbers, dots, underscores, and hyphens")
     if any(not host or "/" in host or ":" in host or "*" in host or host != host.lower() for host in public_hosts):
         raise ValueError("public_hosts must contain exact lowercase hostnames or IPv4 addresses")
     for origin in allowed_origins:
@@ -187,7 +190,7 @@ def create_app(*, database: str | Path = ".agentguard/runs.db", demo: bool = Fal
     from .llm_proxy import install_llm_proxy, validate_upstream_url
     if llm_upstream_url is not None:
         llm_upstream_url = validate_upstream_url(llm_upstream_url)
-        proxy_db.execute("INSERT OR IGNORE INTO proxy_projects(name, upstream) VALUES (?, ?)", ("default", llm_upstream_url))
+        proxy_db.execute("INSERT OR IGNORE INTO proxy_projects(name, upstream) VALUES (?, ?)", (llm_project, llm_upstream_url))
         proxy_db.commit()
 
     def resolve_upstream(name: str) -> str | None:
@@ -601,6 +604,7 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--frontend", default="frontend/dist")
     parser.add_argument("--llm-upstream-url", help="Enable OpenAI-compatible /v1/chat/completions proxy to this provider base URL")
+    parser.add_argument("--llm-project", default=None, help="Project name for --llm-upstream-url (default: default)")
     parser.add_argument("--allow-origin", action="append", default=[], help="Exact trusted frontend origin for LAN development; repeatable")
     args = parser.parse_args()
     if bool(args.cache_database) != bool(args.cache_key_file):
@@ -621,11 +625,13 @@ def main() -> None:
     import json
     policy_scope = json.loads(Path(args.policy_scope).read_text(encoding="utf-8")) if args.policy_scope else None
     database = args.database or (".agentguard/demo.db" if args.demo else ".agentguard/runs.db")
+    upstream_url = args.llm_upstream_url or os.environ.get("AGENTGUARD_LLM_UPSTREAM_URL")
+    llm_project = args.llm_project or os.environ.get("AGENTGUARD_LLM_PROJECT", "default")
     uvicorn.run(create_app(database=database, demo=args.demo, frontend=args.frontend, allowed_origins=tuple(args.allow_origin),
                           credentials=credentials, public_hosts=tuple(args.public_host),
                           policy_signing_key=policy_key, policy_scope=policy_scope,
                           cache_database=args.cache_database, cache_signing_key=cache_key,
-                          llm_upstream_url=args.llm_upstream_url), host=args.host, port=args.port)
+                          llm_upstream_url=upstream_url, llm_project=llm_project), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

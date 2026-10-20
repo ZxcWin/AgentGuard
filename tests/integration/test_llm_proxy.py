@@ -11,6 +11,16 @@ from agentguard.api.http import create_app
 class ProviderHandler(BaseHTTPRequestHandler):
     requests = []
 
+    def do_GET(self):
+        if self.path.endswith("/models"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"object":"list","data":[{"id":"proxy-model","object":"model"}]}')
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
         payload = json.loads(self.rfile.read(length))
@@ -126,6 +136,9 @@ def test_proxy_projects_are_persistent_and_project_scoped(tmp_path):
             assert client.post("/proxy/patent-agent/v1/chat/completions", json={
                 "model": "proxy-model", "messages": [{"role": "user", "content": "hello"}],
             }).status_code == 200
+            models = client.get("/proxy/patent-agent/v1/models")
+            assert models.status_code == 200
+            assert models.json()["data"][0]["id"] == "proxy-model"
             rows = client.get("/api/v1/runs", params={"search": "patent-agent"}).json()
             assert rows["total"] == 1
         with TestClient(create_app(database=database)) as client:
@@ -146,6 +159,54 @@ def test_provider_errors_are_forwarded_and_recorded(tmp_path):
             assert response.status_code == 429
             rows = client.get("/api/v1/runs", params={"search": "default"}).json()
             assert rows["total"] == 1 and rows["items"][0]["status"] == "failed"
+    finally:
+        server.shutdown()
+
+
+def test_policy_rejections_use_openai_error_shape_and_http_status(tmp_path):
+    server = provider_server()
+    try:
+        with TestClient(create_app(database=tmp_path / "runs.db",
+                                   llm_upstream_url=f"http://127.0.0.1:{server.server_port}/v1")) as client:
+            policy = client.get("/api/v1/policies/current").json()
+            config = {"token": {"max_input_tokens": 1}}
+            saved = client.put("/api/v1/policies/current", json={
+                "expected_version": policy["version"], "config": config,
+            })
+            assert saved.status_code == 200
+            response = client.post("/v1/chat/completions", json={
+                "model": "proxy-model", "messages": [{"role": "user", "content": "too many tokens"}],
+            })
+            assert response.status_code == 429
+            assert response.json()["error"]["type"] == "agentguard_error"
+            assert response.json()["error"]["code"] == "input_token_limit"
+            assert response.json()["error"]["message"]
+            assert not ProviderHandler.requests or ProviderHandler.requests[-1].get("messages", [{}])[0].get("content") != "too many tokens"
+    finally:
+        server.shutdown()
+
+
+def test_stream_policy_rejection_is_an_sse_error(tmp_path):
+    server = provider_server()
+    try:
+        with TestClient(create_app(database=tmp_path / "runs.db",
+                                   llm_upstream_url=f"http://127.0.0.1:{server.server_port}/v1")) as client:
+            policy = client.get("/api/v1/policies/current").json()
+            saved = client.put("/api/v1/policies/current", json={
+                "expected_version": policy["version"],
+                "config": {"token": {"max_input_tokens": 1}},
+            })
+            assert saved.status_code == 200
+            response = client.post("/v1/chat/completions", json={
+                "model": "proxy-model", "messages": [{"role": "user", "content": "too many tokens"}],
+                "stream": True,
+            })
+            assert response.status_code == 200
+            lines = [line[6:] for line in response.text.splitlines() if line.startswith("data: {")]
+            error = json.loads(lines[0])["error"]
+            assert error["type"] == "agentguard_error"
+            assert error["code"] == "input_token_limit"
+            assert "data: [DONE]" in response.text
     finally:
         server.shutdown()
 

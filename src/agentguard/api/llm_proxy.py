@@ -8,6 +8,16 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from ..domain.exceptions import (
+    AgentGuardError,
+    AuditUnavailable,
+    BudgetExceeded,
+    CircuitOpen,
+    ExecutionTimeout,
+    QualityViolation,
+    RateLimitExceeded,
+    SecurityViolation,
+)
 
 
 class ProviderResponseError(Exception):
@@ -19,6 +29,28 @@ class ProviderResponseError(Exception):
 
 def provider_error(error: ProviderResponseError) -> Response:
     return Response(error.body, status_code=error.status_code, media_type=error.media_type)
+
+
+def policy_error(error: AgentGuardError) -> JSONResponse:
+    if isinstance(error, (BudgetExceeded, RateLimitExceeded)):
+        status = 429
+    elif isinstance(error, (CircuitOpen, AuditUnavailable)):
+        status = 503
+    elif isinstance(error, ExecutionTimeout):
+        status = 504
+    elif isinstance(error, QualityViolation):
+        status = 502
+    elif isinstance(error, SecurityViolation):
+        status = 400
+    else:
+        status = 400
+    code = getattr(error, "reason_code", type(error).__name__.lower())
+    return JSONResponse({"error": {
+        "message": str(error),
+        "type": "agentguard_error",
+        "param": None,
+        "code": code,
+    }}, status_code=status)
 
 
 def validate_upstream_url(value: str) -> str:
@@ -35,9 +67,10 @@ def install_llm_proxy(app: FastAPI, guard: Any, resolve_upstream: Callable[[str]
 
     def request_headers(request: Request) -> dict[str, str]:
         headers = {"content-type": "application/json", "accept": request.headers.get("accept", "application/json")}
-        authorization = request.headers.get("authorization")
-        if authorization:
-            headers["authorization"] = authorization
+        for name in ("authorization", "x-api-key", "api-key", "anthropic-version", "anthropic-beta"):
+            value = request.headers.get(name)
+            if value:
+                headers[name] = value
         return headers
 
     async def record_transport_failure(name: str, model: str, messages: list[Any], max_tokens: int) -> None:
@@ -122,8 +155,25 @@ def install_llm_proxy(app: FastAPI, guard: Any, resolve_upstream: Callable[[str]
                             else:
                                 yield ("data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")) + "\n\n").encode()
                 except ProviderResponseError as error:
-                    yield ("data: " + json.dumps({"error": {"message": error.body.decode("utf-8", "replace")}},
-                                                  ensure_ascii=False) + "\n\n").encode()
+                    try:
+                        detail = json.loads(error.body)
+                    except (ValueError, TypeError):
+                        detail = {"message": error.body.decode("utf-8", "replace")}
+                    if not isinstance(detail, dict) or "error" not in detail:
+                        detail = {"error": detail}
+                    yield ("data: " + json.dumps(detail, ensure_ascii=False) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                except AgentGuardError as error:
+                    detail = json.loads(policy_error(error).body)
+                    yield ("data: " + json.dumps(detail, ensure_ascii=False, separators=(",", ":")) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                except httpx.HTTPError:
+                    await record_transport_failure(agent_name, model, messages,
+                                                   payload.get("max_tokens", payload.get("max_completion_tokens", 256)))
+                    detail = {"error": {"message": "Unable to reach the configured model provider",
+                                         "type": "agentguard_error", "param": None,
+                                         "code": "upstream_unavailable"}}
+                    yield ("data: " + json.dumps(detail, separators=(",", ":")) + "\n\n").encode()
                     yield b"data: [DONE]\n\n"
 
             return StreamingResponse(events(), media_type="text/event-stream",
@@ -145,8 +195,32 @@ def install_llm_proxy(app: FastAPI, guard: Any, resolve_upstream: Callable[[str]
                                           max_tokens=payload.get("max_tokens", payload.get("max_completion_tokens", 256)))
         except ProviderResponseError as error:
             return provider_error(error)
+        except AgentGuardError as error:
+            return policy_error(error)
         except httpx.HTTPError:
             await record_transport_failure(agent_name, model, messages,
                                            payload.get("max_tokens", payload.get("max_completion_tokens", 256)))
             raise HTTPException(502, "Unable to reach the configured model provider") from None
         return JSONResponse(result)
+
+    @app.get("/v1/models")
+    @app.get("/proxy/{project_name}/v1/models")
+    async def models(request: Request, project_name: str | None = None):
+        if project_name is not None and not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", project_name):
+            raise HTTPException(400, "Project name may contain letters, numbers, dots, underscores, and hyphens")
+        agent_name = project_name or request.headers.get("x-agentguard-agent", "default")[:100]
+        try:
+            upstream_url = resolve_upstream(agent_name)
+        except ValueError as error:
+            raise HTTPException(503, str(error)) from None
+        if upstream_url is None:
+            raise HTTPException(503, "No model upstream configured for this project")
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(validate_upstream_url(upstream_url) + "/models",
+                                             headers=request_headers(request))
+        except httpx.HTTPError:
+            raise HTTPException(502, "Unable to reach the configured model provider") from None
+        return Response(response.content, status_code=response.status_code,
+                        media_type=response.headers.get("content-type", "application/json").split(";")[0])
